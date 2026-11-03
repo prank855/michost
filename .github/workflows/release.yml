@@ -1,0 +1,170 @@
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - Cargo.toml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.version.outputs.should_release }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Compare workspace version
+        id: version
+        shell: pwsh
+        run: |
+          $text = Get-Content -LiteralPath Cargo.toml -Raw
+          if ($text -notmatch '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"') {
+            throw "Could not read [workspace.package] version from Cargo.toml."
+          }
+          $current = $Matches[1]
+
+          $before = "${{ github.event.before }}"
+          $previous = ""
+          if ($before -and $before -notmatch '^0+$') {
+            $oldLines = & git show "${before}:Cargo.toml" 2>$null
+            if ($LASTEXITCODE -eq 0) {
+              $oldText = $oldLines -join "`n"
+              if ($oldText -match '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"') {
+                $previous = $Matches[1]
+              }
+            }
+          }
+
+          $tag = "v$current"
+          $tagExists = $false
+          if ($before -and $before -notmatch '^0+$') {
+            $remoteTags = & git ls-remote --tags origin "refs/tags/$tag"
+            if ($LASTEXITCODE -eq 0 -and $remoteTags) {
+              $tagExists = $true
+            }
+          }
+
+          $shouldRelease = ($current -ne $previous) -and (-not $tagExists)
+          Write-Host "Previous version: '$previous'"
+          Write-Host "Current version:  '$current'"
+          Write-Host "Tag:              '$tag' (exists: $tagExists)"
+          Write-Host "Release:          $shouldRelease"
+
+          "version=$current" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "should_release=$($shouldRelease.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+  release:
+    needs: check
+    if: needs.check.outputs.should_release == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Fetch ASIO SDK
+        shell: pwsh
+        run: |
+          $url = "https://download.steinberg.net/sdk_downloads/ASIO-SDK_2.3.4_2025-10-15.zip"
+          $expected = "57de2c0cd0df0783275987e08255abfa49da12982f9d462ac40b7f57300c36e024dcb65d100b799fb3c96a9c7c5ee86e61ceb0e68d2839324206c1629d3905ed"
+          $zip = Join-Path $env:RUNNER_TEMP "asio-sdk.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          $actual = (Get-FileHash -LiteralPath $zip -Algorithm SHA512).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) {
+            throw "ASIO SDK checksum mismatch: expected $expected, got $actual"
+          }
+          $dest = Join-Path $env:RUNNER_TEMP "asio-sdk"
+          Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
+          $sdk = Get-ChildItem -LiteralPath $dest -Recurse -Directory -Filter ASIOSDK |
+            Select-Object -First 1
+          if ($null -eq $sdk) {
+            throw "The ASIO SDK archive did not contain an ASIOSDK directory."
+          }
+          "ASIOSDK_DIR=$($sdk.FullName)" >> $env:GITHUB_ENV
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Build
+        shell: pwsh
+        run: pwsh -NoProfile -File scripts/build.ps1 -Configuration Release -AsioDir "$env:ASIOSDK_DIR"
+
+      - name: Package
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File scripts/package.ps1 `
+            -Configuration Release `
+            -Version "${{ needs.check.outputs.version }}" `
+            -SkipBuild
+
+      - name: Write checksum
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem -LiteralPath target/dist -Filter *.zip -File |
+            Select-Object -First 1
+          if ($null -eq $zip) {
+            throw "No release zip was produced."
+          }
+          $hash = (Get-FileHash -LiteralPath $zip.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $($zip.Name)" |
+            Set-Content -LiteralPath "$($zip.FullName).sha256" -Encoding ascii
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: MicHost ${{ needs.check.outputs.version }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            ## Download
+
+            Download `MicHost-${{ needs.check.outputs.version }}.zip` from the **Assets** section below, extract it, and run `michost.exe`.
+
+            Windows SmartScreen may warn because the build is not code-signed.
+
+            ## Notes
+
+            - Windows x64 build of MicHost ${{ needs.check.outputs.version }}.
+            - Includes ASIO and WASAPI device support.
+            - Built from the tagged source with the official Steinberg ASIO SDK 2.3.4, fetched at build time and not part of this repository.
+            - The zip includes a SHA-256 checksum file.
+          files: |
+            target/dist/*.zip
+            target/dist/*.zip.sha256

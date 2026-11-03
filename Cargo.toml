@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3"
+members = [
+    "apps/michost",
+    "crates/builtin",
+    "crates/graph",
+    "crates/host-abi",
+    "crates/host-juce",
+    "crates/project",
+    "crates/vmic",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "AGPL-3.0-or-later"
+
+[workspace.dependencies]
+michost-builtin = { path = "crates/builtin" }
+michost-graph = { path = "crates/graph" }
+michost-host-abi = { path = "crates/host-abi" }
+michost-host-juce = { path = "crates/host-juce" }
+michost-project = { path = "crates/project" }
+michost-vmic = { path = "crates/vmic" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+libloading = "0.8"
+rtrb = "0.3"
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow"] }
+egui = "0.32"
+rfd = "0.15"
+tray-icon = { version = "0.25", default-features = false }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Security",
+    "Win32_System_StationsAndDesktops",
+    "Win32_Graphics_Gdi",
+] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "thin"

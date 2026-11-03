@@ -1,0 +1,36 @@
+[package]
+name = "michost"
+default-run = "michost"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "michost"
+path = "src/main.rs"
+
+[[bin]]
+name = "michost-probe"
+path = "src/bin/michost-probe.rs"
+
+[build-dependencies]
+winres = "0.1"
+
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+michost-builtin.workspace = true
+michost-graph.workspace = true
+michost-host-abi.workspace = true
+michost-host-juce.workspace = true
+michost-project.workspace = true
+michost-vmic.workspace = true
+eframe.workspace = true
+egui.workspace = true
+rfd.workspace = true
+rtrb.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tray-icon.workspace = true
+windows-sys = { workspace = true, features = ["Win32_System_ProcessStatus"] }
+winreg = "0.56"

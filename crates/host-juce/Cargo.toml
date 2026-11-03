@@ -1,0 +1,11 @@
+[package]
+name = "michost-host-juce"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+michost-graph.workspace = true
+michost-host-abi.workspace = true
+libloading.workspace = true

@@ -1,0 +1,10 @@
+/target/
+*.log
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.obj
+.vs/
+.vscode/
+

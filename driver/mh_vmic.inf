@@ -1,0 +1,119 @@
+; MicHost virtual microphone (capture-only, root enumerated)
+;
+; Test-signing development package.  Production distribution requires
+; Microsoft attestation signing.  See driver\README.md.
+
+[Version]
+Signature       = "$Windows NT$"
+Class           = MEDIA
+ClassGUID       = {4d36e96c-e325-11ce-bfc1-08002be10318}
+Provider        = %ProviderName%
+DriverVer       = 11/02/2026, 0.1.0.0
+CatalogFile     = mh_vmic.cat
+PnpLockDown     = 1
+
+[SourceDisksNames]
+222 = "MicHost Virtual Microphone Driver",,222
+
+[SourceDisksFiles]
+mh_vmic.sys = 222
+
+[SignatureAttributes]
+mh_vmic.sys = SignatureAttributes.DRM
+
+[SignatureAttributes.DRM]
+DRMLevel = 1300
+
+[Manufacturer]
+%MfgName% = MhVmic,NTamd64.10.0...19041,NTarm64.10.0...19041
+
+[MhVmic.NTamd64.10.0...19041]
+%DeviceDesc% = MhVmic_Install, Root\MicHostVirtualMic
+
+[MhVmic.NTarm64.10.0...19041]
+%DeviceDesc% = MhVmic_Install, Root\MicHostVirtualMic
+
+[DestinationDirs]
+MhVmic_Install.CopyList = 13
+
+[MhVmic_Install.CopyList]
+mh_vmic.sys
+
+[MhVmic_Install.NT]
+Include = ks.inf,wdmaudio.inf
+Needs   = KS.Registration,WDMAUDIO.Registration
+CopyFiles = MhVmic_Install.CopyList
+AddReg = MhVmic_Install.AddReg
+
+[MhVmic_Install.AddReg]
+HKR,,AssociatedFilters,,"wdmaud,swmidi,redbook"
+HKR,,Driver,,mh_vmic.sys
+HKR,Drivers,SubClasses,,"wave,midi,mixer"
+HKR,Drivers\wave\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\midi\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\mixer\wdmaud.drv,Driver,,wdmaud.drv
+HKR,Drivers\wave\wdmaud.drv,Description,,%DeviceDesc%
+HKR,Drivers\mixer\wdmaud.drv,Description,,%DeviceDesc%
+
+[MhVmic_Install.NT.Interfaces]
+AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_Wave%,MhVmic.I.Wave
+AddInterface=%KSCATEGORY_REALTIME%,%KSNAME_Wave%,MhVmic.I.Wave
+AddInterface=%KSCATEGORY_CAPTURE%,%KSNAME_Wave%,MhVmic.I.Wave
+AddInterface=%KSCATEGORY_AUDIO%,%KSNAME_Topology%,MhVmic.I.Topology
+AddInterface=%KSCATEGORY_TOPOLOGY%,%KSNAME_Topology%,MhVmic.I.Topology
+
+[MhVmic.I.Wave]
+AddReg = MhVmic.I.Wave.AddReg
+
+[MhVmic.I.Wave.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%WaveFriendlyName%
+
+[MhVmic.I.Topology]
+AddReg = MhVmic.I.Topology.AddReg
+
+[MhVmic.I.Topology.AddReg]
+HKR,,CLSID,,%Proxy.CLSID%
+HKR,,FriendlyName,,%TopoFriendlyName%
+HKR,EP\0,%PKEY_AudioEndpoint_FormFactor%,0x00010001,4
+HKR,EP\0,%PKEY_AudioEndpoint_Supports_EventDriven_Mode%,0x00010001,0x1
+
+[MhVmic_Install.NT.Services]
+AddService = MhVmic,0x00000002,MhVmic_Service_Inst
+
+[MhVmic_Service_Inst]
+DisplayName    = %SvcDesc%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %13%\mh_vmic.sys
+
+[MhVmic_Install.NT.HW]
+AddReg = MhVmic.HW
+
+[MhVmic.HW]
+; FILE_DEVICE_SOUND
+HKR,,DeviceType,0x10001,0x0000001D
+; SYSTEM, Administrators, Interactive user: generic all.
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;IU)"
+
+[Strings]
+ProviderName = "MicHost"
+MfgName = "MicHost"
+DeviceDesc = "MicHost Virtual Microphone"
+SvcDesc = "MicHost Virtual Microphone Driver"
+WaveFriendlyName = "MicHost Virtual Microphone Wave"
+TopoFriendlyName = "MicHost Virtual Microphone Topology"
+
+KSNAME_Wave = "Wave"
+KSNAME_Topology = "Topology"
+
+Proxy.CLSID = "{17CCA71B-ECD7-11D0-B908-00A0C9223196}"
+KSCATEGORY_AUDIO = "{6994AD04-93EF-11D0-A3CC-00A0C9223196}"
+KSCATEGORY_RENDER = "{65E8773E-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_CAPTURE = "{65E8773D-8F56-11D0-A3B9-00A0C9223196}"
+KSCATEGORY_REALTIME = "{EB115FFC-10C8-4964-831D-6DCB02E6F23F}"
+KSCATEGORY_TOPOLOGY = "{DDA54A40-1E4C-11D1-A050-405705C10000}"
+
+PKEY_AudioEndpoint_FormFactor = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},0"
+PKEY_AudioEndpoint_Supports_EventDriven_Mode = "{1DA5D803-D492-4EDD-8C23-E0C0FFEE7F0E},7"
