@@ -1,3 +1,4 @@
+use michost_builtin::BuiltinKind;
 use michost_host_abi::AudioApi;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -230,7 +231,7 @@ impl Project {
     pub fn remove_builtin_entries(&mut self) -> Vec<String> {
         let mut removed = Vec::new();
         self.chain.retain(|entry| {
-            if entry.plugin.path.starts_with("builtin:") {
+            if BuiltinKind::from_path(&entry.plugin.path).is_some() {
                 removed.push(entry.plugin.name.clone());
                 false
             } else {

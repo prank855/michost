@@ -22,6 +22,89 @@ pub fn gain_to_db(gain: f32) -> f32 {
     }
 }
 
+/// Base-2 logarithm without the libm `log2`/`log10` call.
+///
+/// The mantissa is reduced with `t = (m - 1) / (m + 1)`; the atanh series
+/// through `t^11` is accurate to about 1.5e-8 in `[1, 2)`, which is well below
+/// f32 resolution. Used inside per-sample control loops where the exact
+/// libm call is too expensive; parameter changes still use [`gain_to_db`].
+#[inline]
+pub fn fast_log2(x: f32) -> f32 {
+    if x <= 0.0 || x.is_nan() {
+        return f32::NEG_INFINITY;
+    }
+    if x == f32::INFINITY {
+        return f32::INFINITY;
+    }
+    let mut bits = x.to_bits();
+    let mut exponent = ((bits >> 23) & 0xff) as i32 - 127;
+    if exponent == -127 {
+        // Subnormal: scale into the normal range and account for the shift.
+        let scaled = x * 8_388_608.0;
+        if scaled == 0.0 {
+            return f32::NEG_INFINITY;
+        }
+        bits = scaled.to_bits();
+        exponent = (((bits >> 23) & 0xff) as i32 - 127) - 23;
+    }
+    let mantissa = f32::from_bits((bits & 0x007f_ffff) | 0x3f80_0000);
+    let t = (mantissa - 1.0) / (mantissa + 1.0);
+    let t2 = t * t;
+    let poly =
+        1.0 + t2 * (1.0 / 3.0 + t2 * (1.0 / 5.0 + t2 * (1.0 / 7.0 + t2 * (1.0 / 9.0 + t2 / 11.0))));
+    exponent as f32 + 2.0 * std::f32::consts::LOG2_E * t * poly
+}
+
+/// Base-2 exponential without the libm `exp2`/`powf` call.
+///
+/// The fractional part goes through an 8th-order series and the integer part
+/// is applied by exponent bits. Relative error is below 1e-7 for the gain
+/// ranges used by the built-ins.
+#[inline]
+pub fn fast_exp2(x: f32) -> f32 {
+    if x.is_nan() {
+        return x;
+    }
+    if x > 127.0 {
+        return f32::INFINITY;
+    }
+    if x < -126.0 {
+        return 0.0;
+    }
+    let whole = x.floor();
+    let fraction = x - whole;
+    let z = fraction * std::f32::consts::LN_2;
+    let mut poly = 1.0 / 40_320.0;
+    poly = 1.0 / 5_040.0 + z * poly;
+    poly = 1.0 / 720.0 + z * poly;
+    poly = 1.0 / 120.0 + z * poly;
+    poly = 1.0 / 24.0 + z * poly;
+    poly = 1.0 / 6.0 + z * poly;
+    poly = 0.5 + z * poly;
+    poly = 1.0 + z * poly;
+    poly = 1.0 + z * poly;
+    let scale = f32::from_bits((((whole as i32) + 127) as u32) << 23);
+    poly * scale
+}
+
+/// [`db_to_gain`] for per-sample control loops (no libm `powf`).
+#[inline]
+pub fn fast_db_to_gain(db: f32) -> f32 {
+    if db.is_nan() {
+        return f32::NAN;
+    }
+    fast_exp2(db / (20.0 * std::f32::consts::LOG10_2))
+}
+
+/// [`gain_to_db`] for per-sample control loops (no libm `log10`).
+#[inline]
+pub fn fast_gain_to_db(gain: f32) -> f32 {
+    if gain.is_nan() {
+        return f32::NAN;
+    }
+    (20.0 * std::f32::consts::LOG10_2) * fast_log2(gain)
+}
+
 /// Clamps `value` to `min..=max`. NaN clamps to `min`.
 #[inline]
 pub fn clamp(value: f32, min: f32, max: f32) -> f32 {
@@ -384,6 +467,41 @@ fn rbj_terms(sample_rate: f64, freq_hz: f32) -> Option<(f64, f64)> {
     Some(w0.sin_cos())
 }
 
+/// Fractionally interpolated read from a circular buffer.
+///
+/// `delay` follows [`DelayLine::read`] semantics (1.0 is the previous sample)
+/// and is clamped to `1.0..=len - 2`. The integer part of the delay is wrapped
+/// with `usize` arithmetic instead of an `f64` `rem_euclid`/`floor` per sample.
+#[inline]
+pub fn circular_read(buffer: &[f32], write: usize, delay: f32) -> f32 {
+    let length = buffer.len();
+    if length < 3 || write >= length {
+        return 0.0;
+    }
+    let max = (length - 2) as f32;
+    let delay = if delay.is_finite() {
+        delay.clamp(1.0, max)
+    } else {
+        1.0
+    };
+    let whole = delay as usize;
+    let fraction = delay - whole as f32;
+    let (index, fraction) = if fraction > 0.0 {
+        (wrap_index(write, whole + 1, length), 1.0 - fraction)
+    } else {
+        (wrap_index(write, whole, length), 0.0)
+    };
+    let next = if index + 1 == length { 0 } else { index + 1 };
+    let current = buffer[index];
+    current + (buffer[next] - current) * fraction
+}
+
+#[inline]
+fn wrap_index(write: usize, amount: usize, length: usize) -> usize {
+    let sum = write + length - amount;
+    if sum >= length { sum - length } else { sum }
+}
+
 /// Preallocated circular delay line with linear-interpolated fractional reads.
 #[derive(Clone, Debug)]
 pub struct DelayLine {
@@ -429,24 +547,7 @@ impl DelayLine {
     /// Reads `delay_samples` back (1.0 = previous sample), interpolating
     /// linearly. Values are clamped to `1.0..=max_delay_samples`.
     pub fn read(&self, delay_samples: f32) -> f32 {
-        let length = self.buffer.len();
-        if length < 2 {
-            return 0.0;
-        }
-        let max = (length - 2) as f64;
-        let delay = if delay_samples.is_finite() {
-            f64::from(delay_samples).clamp(1.0, max)
-        } else {
-            1.0
-        };
-        let mut position = (self.write as f64 - delay).rem_euclid(length as f64);
-        if position >= length as f64 {
-            position = 0.0;
-        }
-        let index = (position.floor() as usize).min(length - 1);
-        let fraction = (position - index as f64) as f32;
-        let next = if index + 1 == length { 0 } else { index + 1 };
-        self.buffer[index] + (self.buffer[next] - self.buffer[index]) * fraction
+        circular_read(&self.buffer, self.write, delay_samples)
     }
 
     pub fn clear(&mut self) {
@@ -464,7 +565,26 @@ pub fn soft_clip(x: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::DelayLine;
+    use super::{
+        DelayLine, circular_read, db_to_gain, fast_db_to_gain, fast_gain_to_db, fast_log2,
+    };
+
+    /// Reference implementation kept in `f64` with `rem_euclid`/`floor`; the
+    /// integer path must produce the same interpolation.
+    fn reference_read(buffer: &[f32], write: usize, delay: f32) -> f32 {
+        let length = buffer.len();
+        let max = (length - 2) as f32;
+        let delay = if delay.is_finite() {
+            delay.clamp(1.0, max)
+        } else {
+            1.0
+        };
+        let position = (write as f64 - f64::from(delay)).rem_euclid(length as f64);
+        let index = (position.floor() as usize).min(length - 1);
+        let fraction = (position - index as f64) as f32;
+        let next = if index + 1 == length { 0 } else { index + 1 };
+        buffer[index] + (buffer[next] - buffer[index]) * fraction
+    }
 
     #[test]
     fn fractional_reads_at_the_wrap_boundary_stay_in_bounds() {
@@ -474,5 +594,44 @@ mod tests {
             let value = line.read(delay);
             assert!(value.is_finite());
         }
+    }
+
+    #[test]
+    fn circular_read_matches_the_f64_reference() {
+        let buffer: Vec<f32> = (0..97).map(|index| index as f32 * 0.25 - 3.0).collect();
+        for write in [0usize, 1, 37, 96] {
+            for delay in [1.0f32, 1.5, 2.0, 17.25, 42.75, 95.0, 500.0, f32::NAN] {
+                let measured = circular_read(&buffer, write, delay);
+                let expected = reference_read(&buffer, write, delay);
+                assert!(
+                    (measured - expected).abs() < 1.0e-6,
+                    "write {write} delay {delay}: {measured} != {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn circular_read_handles_degenerate_buffers() {
+        assert_eq!(circular_read(&[], 0, 1.0), 0.0);
+        assert_eq!(circular_read(&[1.0], 0, 1.0), 0.0);
+        assert!(circular_read(&[1.0, 2.0], 0, 1.0).is_finite());
+    }
+
+    #[test]
+    fn fast_log_and_exp_are_accurate() {
+        for db in [-80.0f32, -40.0, -6.0, -0.5, 0.0, 3.0, 12.0] {
+            let exact = db_to_gain(db);
+            let fast = fast_db_to_gain(db);
+            assert!(
+                (fast - exact).abs() <= exact.abs() * 2.0e-6 + 1.0e-12,
+                "db {db}: {fast} != {exact}"
+            );
+            let back = fast_gain_to_db(exact);
+            assert!((back - db).abs() < 1.0e-5, "db {db}: round trip {back}");
+        }
+        let round_trip = fast_log2(std::f32::consts::PI);
+        assert!((round_trip - std::f32::consts::PI.log2()).abs() < 1.0e-6);
+        assert_eq!(fast_gain_to_db(0.0), f32::NEG_INFINITY);
     }
 }

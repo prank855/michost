@@ -9,7 +9,9 @@
 use std::f32::consts::FRAC_1_SQRT_2;
 use std::f64::consts::PI;
 
-use crate::dsp_util::{Biquad, EnvelopeFollower, OnePole, db_to_gain, gain_to_db};
+use crate::dsp_util::{
+    Biquad, EnvelopeFollower, OnePole, db_to_gain, fast_db_to_gain, fast_gain_to_db,
+};
 use crate::{BuiltinDsp, ParamCurve, ParamSet, ParamSpec, ParamStyle};
 
 pub static SPECS: &[ParamSpec] = &[
@@ -467,14 +469,58 @@ fn static_gain_db(level_db: f32, threshold_db: f32, ratio: f32, knee_db: f32) ->
     }
 }
 
-/// Linear gain reduction for one linked peak level.
-#[inline]
-fn compressed_gain(level: f32, threshold_db: f32, ratio: f32, knee_db: f32) -> f32 {
-    let gain_db = static_gain_db(gain_to_db(level), threshold_db, ratio, knee_db);
-    if gain_db <= 0.0 {
-        db_to_gain(gain_db)
-    } else {
-        1.0
+/// Per-block compressor curve. The threshold/knee limits are converted once,
+/// then each sample only needs a fast log/exp pair; quiet samples below the
+/// knee start early-out at unity with no transcendental at all.
+#[derive(Clone, Copy)]
+struct GainCurve {
+    threshold_db: f32,
+    ratio: f32,
+    knee_db: f32,
+    knee_start_gain: f32,
+}
+
+impl GainCurve {
+    fn new(threshold_db: f32, ratio: f32, knee_db: f32) -> Self {
+        let ratio = if ratio.is_finite() {
+            ratio.max(1.0)
+        } else {
+            1.0
+        };
+        let knee = if knee_db.is_finite() {
+            knee_db.max(0.0)
+        } else {
+            0.0
+        };
+        let threshold = if threshold_db.is_nan() {
+            0.0
+        } else {
+            threshold_db
+        };
+        Self {
+            threshold_db,
+            ratio,
+            knee_db: knee,
+            knee_start_gain: db_to_gain(threshold - knee * 0.5),
+        }
+    }
+
+    #[inline]
+    fn gain(&self, level: f32) -> f32 {
+        if level <= self.knee_start_gain || level.is_nan() {
+            return 1.0;
+        }
+        let gain_db = static_gain_db(
+            fast_gain_to_db(level),
+            self.threshold_db,
+            self.ratio,
+            self.knee_db,
+        );
+        if gain_db < 0.0 {
+            fast_db_to_gain(gain_db)
+        } else {
+            1.0
+        }
     }
 }
 
@@ -674,6 +720,11 @@ impl Core {
             self.primed = true;
         }
 
+        let single_curve = GainCurve::new(threshold_db, ratio, knee_db);
+        let low_curve = GainCurve::new(low_threshold_db, low_ratio, knee_db);
+        let mid_curve = GainCurve::new(mid_threshold_db, mid_ratio, knee_db);
+        let high_curve = GainCurve::new(high_threshold_db, high_ratio, knee_db);
+
         for (l, r) in left.iter_mut().zip(right.iter_mut()) {
             let dry_l = *l;
             let dry_r = *r;
@@ -684,36 +735,17 @@ impl Core {
                 let (low_l, mid_l, high_l) = self.filters_l.split(dry_l);
                 let (low_r, mid_r, high_r) = self.filters_r.split(dry_r);
 
-                let low_gain = compressed_gain(
-                    self.bands[0].process(low_l.abs().max(low_r.abs())),
-                    low_threshold_db,
-                    low_ratio,
-                    knee_db,
-                );
-                let mid_gain = compressed_gain(
-                    self.bands[1].process(mid_l.abs().max(mid_r.abs())),
-                    mid_threshold_db,
-                    mid_ratio,
-                    knee_db,
-                );
-                let high_gain = compressed_gain(
-                    self.bands[2].process(high_l.abs().max(high_r.abs())),
-                    high_threshold_db,
-                    high_ratio,
-                    knee_db,
-                );
+                let low_gain = low_curve.gain(self.bands[0].process(low_l.abs().max(low_r.abs())));
+                let mid_gain = mid_curve.gain(self.bands[1].process(mid_l.abs().max(mid_r.abs())));
+                let high_gain =
+                    high_curve.gain(self.bands[2].process(high_l.abs().max(high_r.abs())));
 
                 (
                     (low_l * low_gain + mid_l * mid_gain + high_l * high_gain) * makeup,
                     (low_r * low_gain + mid_r * mid_gain + high_r * high_gain) * makeup,
                 )
             } else {
-                let gain = compressed_gain(
-                    self.single.process(dry_l.abs().max(dry_r.abs())),
-                    threshold_db,
-                    ratio,
-                    knee_db,
-                );
+                let gain = single_curve.gain(self.single.process(dry_l.abs().max(dry_r.abs())));
                 (dry_l * gain * makeup, dry_r * gain * makeup)
             };
 

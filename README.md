@@ -14,13 +14,13 @@ microphone -> MicHost -> plugins and effects -> virtual cable or output device -
 
 **[Download the latest MicHost release](https://github.com/prank855/michost/releases/latest)**
 
-Windows 10 or 11, 64-bit. No installer.
+Windows 10 or 11, 64-bit. Optional per-user installer, or run it portably.
 
 1. Download `MicHost-<version>.zip` from the release page.
 2. Extract the zip.
-3. Run `michost.exe`.
+3. Either double-click `Install.cmd` for a per-user install with Start Menu shortcuts, or run `michost.exe` directly.
 
-Keep `michost.exe`, `michost-probe.exe` and `mic_host.dll` in the same folder. Release builds include both ASIO and WASAPI device support.
+The installer copies MicHost to `%LOCALAPPDATA%\Programs\MicHost\<build>` and adds one `MicHost` Start Menu shortcut. It registers an uninstall entry in Windows Settings > Apps and does not require administrator rights. Portable use still works: keep `michost.exe`, `michost-probe.exe` and `mic_host.dll` in the same folder.
 
 Windows SmartScreen may warn because the app is not code-signed. Choose **More info**, then **Run anyway** only if you trust the source.
 

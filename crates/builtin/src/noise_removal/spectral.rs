@@ -136,6 +136,14 @@ struct Settings {
     slow: f32,
 }
 
+/// True when no suppression is requested. The audio path then skips the STFT
+/// entirely and only maintains a 256-sample delayed copy.
+pub(crate) fn is_bypass(params: &ParamSet) -> bool {
+    let amount = read(params, "strength", 50.0).clamp(0.0, 100.0) / 100.0;
+    let reduction_db = read(params, "reduction_db", 20.0).clamp(0.0, 60.0);
+    amount <= 1.0e-6 || reduction_db <= 1.0e-6
+}
+
 pub(crate) struct Spectral {
     sample_rate: f64,
     frames_per_second: f64,
@@ -175,6 +183,10 @@ pub(crate) struct Spectral {
     applied_gain: [f32; BINS],
     median_history1: [f32; BINS],
     median_history2: [f32; BINS],
+
+    floor_weight: [f32; BINS],
+    voice_weight: [f32; BINS],
+    floor_gain: [f32; BINS],
 }
 
 impl Spectral {
@@ -190,6 +202,13 @@ impl Spectral {
             let hann = 0.5 - 0.5 * (2.0 * PI * index as f64 / FFT_SIZE as f64).cos();
             *slot = hann.max(0.0).sqrt() as f32;
         }
+
+        let nyquist = sample_rate as f32 * 0.5;
+        let bin_hz: [f32; BINS] =
+            std::array::from_fn(|bin| bin as f32 * sample_rate as f32 / FFT_SIZE as f32);
+        let floor_weight: [f32; BINS] =
+            std::array::from_fn(|bin| floor_weight(bin_hz[bin], nyquist));
+        let voice_weight: [f32; BINS] = std::array::from_fn(|bin| voice_floor_weight(bin_hz[bin]));
 
         Self {
             sample_rate,
@@ -224,6 +243,9 @@ impl Spectral {
             applied_gain: [1.0; BINS],
             median_history1: [1.0; BINS],
             median_history2: [1.0; BINS],
+            floor_weight,
+            voice_weight,
+            floor_gain: [1.0; BINS],
         }
     }
 
@@ -296,6 +318,31 @@ impl Spectral {
             fast: smoothing_coefficient(4.0, self.frames_per_second),
             slow: smoothing_coefficient(90.0, self.frames_per_second),
         };
+
+        if settings.bypass {
+            // No FFT, no per-bin work: keep the same 256-sample delayed path
+            // so latency and dry-path alignment are unchanged.
+            for index in 0..frames {
+                let sample_left = sanitize(left[index]);
+                let sample_right = sanitize(right[index]);
+
+                let slot = self.history_count & INPUT_MASK;
+                self.history_left[slot] = sample_left;
+                self.history_right[slot] = sample_right;
+                self.history_count = self.history_count.wrapping_add(1);
+
+                let write_slot = self.output_position.wrapping_add(FFT_SIZE) & OUT_MASK;
+                self.output_left[write_slot] = sample_left;
+                self.output_right[write_slot] = sample_right;
+                let read_slot = self.output_position & OUT_MASK;
+                left[index] = sanitize(self.output_left[read_slot]);
+                right[index] = sanitize(self.output_right[read_slot]);
+                self.output_left[read_slot] = 0.0;
+                self.output_right[read_slot] = 0.0;
+                self.output_position = self.output_position.wrapping_add(1);
+            }
+            return;
+        }
 
         for index in 0..frames {
             let sample_left = sanitize(left[index]);
@@ -473,9 +520,12 @@ impl Spectral {
             let g_lsa = (xi / (1.0 + xi) * (0.5 * e1_approx(v)).exp()).clamp(0.0, 1.0);
             self.prev_lsa_gain[bin] = g_lsa;
 
-            let frequency = bin as f32 * self.sample_rate as f32 / FFT_SIZE as f32;
-            let weight = floor_weight(frequency, self.sample_rate as f32 * 0.5);
-            let floor = 10.0_f32.powf(-reduction_db * weight / 20.0).clamp(EPS, 1.0);
+            // One powf per bin per hop: the linear floor and its logarithm are
+            // cached for the temporal loop below.
+            let weight = self.floor_weight[bin];
+            let floor_log = -reduction_db * weight / 20.0 * std::f32::consts::LN_10;
+            let floor = floor_log.exp().clamp(EPS, 1.0);
+            self.floor_gain[bin] = floor;
 
             // OM-LSA log-domain mix. During a speech hold, keep some LSA
             // weight so consonants survive the noise-only floor.
@@ -484,8 +534,7 @@ impl Spectral {
             } else {
                 self.speech_prob_bins[bin]
             };
-            let log_gain =
-                probability * g_lsa.max(1.0e-8).ln() + (1.0 - probability) * floor.max(1.0e-8).ln();
+            let log_gain = probability * g_lsa.max(1.0e-8).ln() + (1.0 - probability) * floor_log;
             self.log_spectrum[bin] = if log_gain.is_finite() { log_gain } else { 0.0 };
         }
 
@@ -510,24 +559,18 @@ impl Spectral {
         let noise_only = !speech_active && speech_mean < 0.30;
         let fast_release = self.onset_hold > 0;
         for bin in 0..BINS {
-            let frequency = bin as f32 * self.sample_rate as f32 / FFT_SIZE as f32;
-            let weight = floor_weight(frequency, self.sample_rate as f32 * 0.5);
-            let floor = 10.0_f32
-                .powf(-settings.reduction_db * weight / 20.0)
-                .clamp(EPS, 1.0);
+            let floor = self.floor_gain[bin];
             // Strength scales the attenuation continuously in the gain
-            // domain (0 = bypass, 1 = full target). This keeps 1-99% useful
-            // instead of snapping between "off" and "on".
-            let mut target = self.smoothed_log[bin]
+            // domain (0 = bypass, 1 = full target). One exp replaces the
+            // previous exp-then-powf pair.
+            let mut target = (self.smoothed_log[bin] * settings.amount)
                 .exp()
-                .powf(settings.amount)
                 .clamp(floor, 1.0);
             // Keep a speech floor in the voice band even when the OM-LSA
             // probability is high. This is what prevents a 20-60 dB reduction
             // from hollowing out formants; the Voice knob controls how much.
             if settings.voice > 0.001 {
-                let frequency = bin as f32 * self.sample_rate as f32 / FFT_SIZE as f32;
-                let weight = voice_floor_weight(frequency);
+                let weight = self.voice_weight[bin];
                 let probability = if speech_active {
                     self.speech_prob_bins[bin].max(0.5)
                 } else {

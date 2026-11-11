@@ -322,10 +322,8 @@ int32_t mh_plugin_describe(void* manager,
             return MH_ERR;
 
         const auto descriptions = enumerateModule(toJuce(path));
-        if (descriptions.empty()) {
-            reportError(*host, MH_ERR, "reading the plugin module failed");
+        if (descriptions.empty())
             return MH_ERR;
-        }
 
         std::vector<const juce::PluginDescription*> classes;
         juce::StringArray seen;
@@ -356,7 +354,6 @@ int32_t mh_plugin_describe(void* manager,
         *count = total;
         return MH_OK;
     } catch (...) {
-        reportError(*host, MH_ERR, "describing the plugin module failed");
         return MH_ERR;
     }
 }
@@ -445,10 +442,8 @@ static int32_t loadPlugin(void* manager,
         result.error = "the plugin could not be instantiated";
     }
 
-    if (result.status != MH_OK) {
-        reportError(*host, result.status, result.error);
+    if (result.status != MH_OK)
         return result.status;
-    }
 
     try {
         const std::lock_guard<std::mutex> lock(host->pluginMutex);
@@ -687,15 +682,12 @@ int32_t mh_plugin_prepare(void* manager,
             return prepared;
         });
 
-        if (result.status != MH_OK) {
-            reportError(*host, result.status, result.message);
+        if (result.status != MH_OK)
             return result.status;
-        }
 
         reportLatency(*host, *instance);
         return MH_OK;
     } catch (...) {
-        reportError(*host, MH_ERR, "preparing the plugin failed");
         return MH_ERR;
     }
 }
@@ -727,15 +719,12 @@ int32_t mh_plugin_activate(void* manager, void* handle, int32_t active)
             return MH_OK;
         });
 
-        if (status != MH_OK) {
-            reportError(*host, status, "the plugin must be prepared before it can be activated");
+        if (status != MH_OK)
             return status;
-        }
 
         reportLatency(*host, *instance);
         return MH_OK;
     } catch (...) {
-        reportError(*host, MH_ERR, "activating the plugin failed");
         return MH_ERR;
     }
 }

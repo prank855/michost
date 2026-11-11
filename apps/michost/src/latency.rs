@@ -13,6 +13,9 @@ const MAX_DELAY_MILLIS: u64 = 400;
 const RETRIGGER_FRAMES: usize = 1024;
 const MAX_CAPTURE_FRAMES: usize = 64_000_000;
 
+const DEFAULT_OUTPUT_TOKENS: &[&str] = &["cable input"];
+const DEFAULT_INPUT_TOKENS: &[&str] = &["cable output", "microphone vb audio virtual cable"];
+
 #[derive(Clone, Debug)]
 pub struct Options {
     pub seconds: u64,
@@ -78,6 +81,45 @@ struct InputContext {
     dropped: u64,
 }
 
+struct DuplexContext {
+    output: OutputContext,
+    input: InputContext,
+}
+
+unsafe extern "C" fn duplex_input(
+    ctx: *mut c_void,
+    channels: *const *const f32,
+    num_channels: i32,
+    frames: i32,
+    sample_pos: i64,
+) {
+    if ctx.is_null() {
+        return;
+    }
+    unsafe {
+        let context = &mut *(ctx as *mut DuplexContext);
+        let input = (&mut context.input as *mut InputContext).cast::<c_void>();
+        input_callback(input, channels, num_channels, frames, sample_pos);
+    }
+}
+
+unsafe extern "C" fn duplex_output(
+    ctx: *mut c_void,
+    channels: *const *mut f32,
+    num_channels: i32,
+    frames: i32,
+    sample_pos: i64,
+) {
+    if ctx.is_null() {
+        return;
+    }
+    unsafe {
+        let context = &mut *(ctx as *mut DuplexContext);
+        let output = (&mut context.output as *mut OutputContext).cast::<c_void>();
+        output_callback(output, channels, num_channels, frames, sample_pos);
+    }
+}
+
 struct BlockStamp {
     start: u64,
     time: Instant,
@@ -113,7 +155,7 @@ pub fn run(options: Options) -> i32 {
         DeviceKind::Output,
         options.output.as_deref(),
         api,
-        "cable input",
+        DEFAULT_OUTPUT_TOKENS,
     ) else {
         println!(
             "MicHost latency selftest: SKIP (no matching {} output; use --output <name>)",
@@ -126,7 +168,7 @@ pub fn run(options: Options) -> i32 {
         DeviceKind::Input,
         options.input.as_deref(),
         api,
-        "cable output",
+        DEFAULT_INPUT_TOKENS,
     ) else {
         println!(
             "MicHost latency selftest: SKIP (no matching {} input; use --input <name>)",
@@ -135,16 +177,32 @@ pub fn run(options: Options) -> i32 {
         return 0;
     };
 
-    let result = match measure(
-        &backend,
-        output,
-        input,
-        seconds,
-        api,
-        api,
-        options.block_size,
-        options.block_size,
-    ) {
+    let result = if api == AudioApi::Asio && output.name == input.name {
+        measure_duplex(
+            &backend,
+            output,
+            input,
+            seconds,
+            api,
+            output.outputs.clamp(1, 2),
+            0,
+            input.inputs.clamp(1, 2),
+            0,
+            options.block_size,
+        )
+    } else {
+        measure(
+            &backend,
+            output,
+            input,
+            seconds,
+            api,
+            api,
+            options.block_size,
+            options.block_size,
+        )
+    };
+    let result = match result {
         Ok(result) => result,
         Err(error) => {
             println!("MicHost latency selftest: FAILED: {error}");
@@ -204,12 +262,11 @@ pub fn measure(
 
     let capture_capacity = ((default_rate.max(48_000.0) * (seconds as f64 + 2.0)) as usize)
         .clamp(4096, MAX_CAPTURE_FRAMES);
-    let (samples_tx, mut samples_rx) = rtrb::RingBuffer::new(capture_capacity);
-    let (blocks_tx, mut blocks_rx) = rtrb::RingBuffer::new(
+    let (samples_tx, samples_rx) = rtrb::RingBuffer::new(capture_capacity);
+    let (blocks_tx, blocks_rx) = rtrb::RingBuffer::new(
         ((default_rate * (seconds as f64 + 2.0) / block_hint as f64) as usize).clamp(4096, 262_144),
     );
-    let (clicks_tx, mut clicks_rx) =
-        rtrb::RingBuffer::new((seconds as usize * 2 + 16).clamp(16, 4096));
+    let (clicks_tx, clicks_rx) = rtrb::RingBuffer::new((seconds as usize * 2 + 16).clamp(16, 4096));
 
     let mut output_context = Box::new(OutputContext {
         rate: default_rate,
@@ -333,6 +390,29 @@ pub fn measure(
     backend.close_stream(input_stream);
     backend.close_stream(output_stream);
 
+    assemble_measurement(
+        samples_rx,
+        blocks_rx,
+        clicks_rx,
+        input_context.dropped,
+        out_rate,
+        in_rate,
+        output_latency,
+        input_latency,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assemble_measurement(
+    mut samples_rx: rtrb::Consumer<f32>,
+    mut blocks_rx: rtrb::Consumer<BlockStamp>,
+    mut clicks_rx: rtrb::Consumer<Instant>,
+    dropped: u64,
+    out_rate: f64,
+    in_rate: f64,
+    output_latency: DeviceLatency,
+    input_latency: DeviceLatency,
+) -> Result<Measurement, String> {
     let mut captured = Vec::new();
     while let Ok(sample) = samples_rx.pop() {
         captured.push(sample);
@@ -345,7 +425,6 @@ pub fn measure(
     while let Ok(click) = clicks_rx.pop() {
         clicks.push(click);
     }
-    let dropped = input_context.dropped;
 
     if captured.is_empty() {
         return Err("no capture frames".to_string());
@@ -411,6 +490,116 @@ pub fn measure(
         output_latency: output_latency.output,
         input_latency: input_latency.input,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn measure_duplex(
+    backend: &JuceBackend,
+    output: &DeviceInfo,
+    input: &DeviceInfo,
+    seconds: u64,
+    api: AudioApi,
+    output_channels: u32,
+    output_mask: u64,
+    input_channels: u32,
+    input_mask: u64,
+    block_size: u32,
+) -> Result<Measurement, String> {
+    if api != AudioApi::Asio {
+        return Err("duplex measurement requires ASIO".to_string());
+    }
+    if output.name != input.name {
+        return Err("duplex measurement requires one ASIO device".to_string());
+    }
+    let seconds = seconds.max(1);
+    let out_channels = output_channels.clamp(1, 2);
+    let in_channels = input_channels.clamp(1, 8);
+    let default_rate = if input.default_sample_rate > 0.0 {
+        input.default_sample_rate
+    } else {
+        48_000.0
+    };
+    let capture_capacity = ((default_rate.max(48_000.0) * (seconds as f64 + 2.0)) as usize)
+        .clamp(4096, MAX_CAPTURE_FRAMES);
+    let (samples_tx, samples_rx) = rtrb::RingBuffer::new(capture_capacity);
+    let (blocks_tx, blocks_rx) = rtrb::RingBuffer::new(
+        ((default_rate * (seconds as f64 + 2.0) / block_size.max(1) as f64) as usize)
+            .clamp(4096, 262_144),
+    );
+    let (clicks_tx, clicks_rx) = rtrb::RingBuffer::new((seconds as usize * 2 + 16).clamp(16, 4096));
+    let mut context = Box::new(DuplexContext {
+        output: OutputContext {
+            rate: default_rate,
+            period: ((default_rate * PERIOD_MILLIS as f64) / 1000.0)
+                .round()
+                .max(BURST_FRAMES as f64) as u64,
+            pattern: Vec::new(),
+            position: 0,
+            clicks: clicks_tx,
+        },
+        input: InputContext {
+            rate: default_rate,
+            samples: samples_tx,
+            blocks: blocks_tx,
+            written: 0,
+            dropped: 0,
+        },
+    });
+    let callbacks = StreamCallbacks {
+        ctx: (&mut *context as *mut DuplexContext).cast::<c_void>(),
+        on_input: Some(duplex_input),
+        on_output: Some(duplex_output),
+        on_error: None,
+    };
+    let config = StreamConfig {
+        device: output.name.clone(),
+        sample_rate: 0.0,
+        block_size,
+        channels: in_channels,
+        api,
+        direction: StreamDirection::Input,
+        channel_mask: input_mask,
+        output_channels: out_channels,
+        output_channel_mask: output_mask,
+    };
+    let stream = backend.open_stream(&config, callbacks).map_err(|error| {
+        format!(
+            "opening ASIO duplex '{}': {error}; {}",
+            output.name,
+            buffer_hint(output)
+        )
+    })?;
+    let latency = match backend.stream_latency(&stream) {
+        Ok(latency) => latency,
+        Err(error) => {
+            backend.close_stream(stream);
+            return Err(format!("reading ASIO duplex latency: {error}"));
+        }
+    };
+    let out_rate = if latency.sample_rate > 0 {
+        latency.sample_rate as f64
+    } else {
+        default_rate
+    };
+    let in_rate = out_rate;
+    context.output.rate = out_rate;
+    context.output.period = ((out_rate * PERIOD_MILLIS as f64) / 1000.0)
+        .round()
+        .max(BURST_FRAMES as f64) as u64;
+    context.output.pattern = make_pattern(out_rate, context.output.period as usize);
+    context.input.rate = in_rate;
+    if let Err(error) = backend.start_stream(&stream) {
+        backend.close_stream(stream);
+        return Err(format!("starting ASIO duplex: {error}"));
+    }
+    std::thread::sleep(Duration::from_secs(seconds));
+    let _ = backend.stop_stream(&stream);
+    backend.close_stream(stream);
+
+    let dropped = context.input.dropped;
+    assemble_measurement(
+        samples_rx, blocks_rx, clicks_rx, dropped, out_rate, in_rate, latency, latency,
+    )
 }
 
 pub struct Capture {
@@ -580,28 +769,53 @@ fn pick<'a>(
     kind: DeviceKind,
     wanted: Option<&str>,
     api: AudioApi,
-    needle: &str,
+    needles: &[&str],
 ) -> Option<&'a DeviceInfo> {
     let has_channels = |device: &DeviceInfo| match kind {
         DeviceKind::Input => device.inputs > 0,
         DeviceKind::Output => device.outputs > 0,
     };
     if let Some(wanted) = wanted {
-        let wanted = wanted.to_lowercase();
+        let wanted_tokens = normalize_tokens(wanted);
         if let Some(device) = devices.iter().find(|device| {
-            device.api == api && has_channels(device) && device.name.to_lowercase() == wanted
+            device.api == api
+                && has_channels(device)
+                && normalize_tokens(&device.name) == wanted_tokens
         }) {
             return Some(device);
         }
         return devices.iter().find(|device| {
-            device.api == api
-                && has_channels(device)
-                && device.name.to_lowercase().contains(&wanted)
+            device.api == api && has_channels(device) && matches_needles(&device.name, &[wanted])
         });
     }
     devices.iter().find(|device| {
-        device.api == api && has_channels(device) && device.name.to_lowercase().contains(needle)
+        device.api == api && has_channels(device) && matches_needles(&device.name, needles)
     })
+}
+
+fn normalize_tokens(value: &str) -> Vec<String> {
+    value
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|token| !token.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect()
+}
+
+fn matches_needles(name: &str, needles: &[&str]) -> bool {
+    let tokens = normalize_tokens(name);
+    needles
+        .iter()
+        .any(|needle| contains_tokens(&tokens, needle))
+}
+
+fn contains_tokens(tokens: &[String], needle: &str) -> bool {
+    let needle = normalize_tokens(needle);
+    if needle.is_empty() {
+        return false;
+    }
+    tokens
+        .windows(needle.len())
+        .any(|window| window == needle.as_slice())
 }
 
 fn make_pattern(rate: f64, period: usize) -> Vec<f32> {
@@ -738,7 +952,9 @@ fn api_name(api: AudioApi) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{detect_onsets, percentile};
+    use super::{
+        DEFAULT_INPUT_TOKENS, DEFAULT_OUTPUT_TOKENS, detect_onsets, matches_needles, percentile,
+    };
 
     #[test]
     fn detects_each_burst_once() {
@@ -758,5 +974,48 @@ mod tests {
         assert_eq!(percentile(&values, 0.0), 10.0);
         assert_eq!(percentile(&values, 0.5), 20.0);
         assert_eq!(percentile(&values, 1.0), 30.0);
+    }
+
+    #[test]
+    fn default_cable_tokens_match_both_capture_names() {
+        assert!(matches_needles(
+            "CABLE Output (VB-Audio Virtual Cable)",
+            DEFAULT_INPUT_TOKENS
+        ));
+        assert!(matches_needles(
+            "Microphone (VB-Audio Virtual Cable)",
+            DEFAULT_INPUT_TOKENS
+        ));
+        assert!(!matches_needles(
+            "CABLE Input (VB-Audio Virtual Cable)",
+            DEFAULT_INPUT_TOKENS
+        ));
+        assert!(matches_needles(
+            "CABLE Input (VB-Audio Virtual Cable)",
+            DEFAULT_OUTPUT_TOKENS
+        ));
+        assert!(!matches_needles(
+            "CABLE Output (VB-Audio Virtual Cable)",
+            DEFAULT_OUTPUT_TOKENS
+        ));
+    }
+
+    #[test]
+    fn cable_tokens_ignore_case_and_punctuation() {
+        assert!(matches_needles("cable-input", DEFAULT_OUTPUT_TOKENS));
+        assert!(matches_needles("CABLE  INPUT", DEFAULT_OUTPUT_TOKENS));
+        assert!(matches_needles("[CABLE_Output]", DEFAULT_INPUT_TOKENS));
+        assert!(matches_needles(
+            "microphone / vb-audio / virtual cable",
+            DEFAULT_INPUT_TOKENS
+        ));
+        assert!(!matches_needles(
+            "Speakers (Realtek(R) Audio)",
+            DEFAULT_OUTPUT_TOKENS
+        ));
+        assert!(!matches_needles(
+            "Microphone (Realtek(R) Audio)",
+            DEFAULT_INPUT_TOKENS
+        ));
     }
 }

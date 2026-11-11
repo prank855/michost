@@ -880,6 +880,39 @@ impl StreamBridge {
             .map_err(|_| "the engine update queue is full".to_string())
     }
 
+    pub fn endpoint_latencies(
+        &self,
+    ) -> Result<
+        (
+            michost_host_abi::DeviceLatency,
+            Option<michost_host_abi::DeviceLatency>,
+            Option<michost_host_abi::DeviceLatency>,
+        ),
+        String,
+    > {
+        let input = self
+            .input_stream
+            .as_ref()
+            .ok_or_else(|| "the input stream is closed".to_string())?;
+        let input = self
+            .host
+            .stream_latency(input)
+            .map_err(|error| format!("reading input latency: {error}"))?;
+        let second = self
+            .second_input_stream
+            .as_ref()
+            .map(|stream| self.host.stream_latency(stream))
+            .transpose()
+            .map_err(|error| format!("reading second input latency: {error}"))?;
+        let output = self
+            .output_stream
+            .as_ref()
+            .map(|stream| self.host.stream_latency(stream))
+            .transpose()
+            .map_err(|error| format!("reading output latency: {error}"))?;
+        Ok((input, second, output))
+    }
+
     pub fn collect_retired(&mut self) {
         while let Ok(engine) = self.retired.pop() {
             drop(engine);
@@ -1189,8 +1222,41 @@ fn db_to_gain(db: f32) -> f32 {
     }
 }
 
+/// Enables flush-to-zero and denormals-are-zero for this thread.
+///
+/// Built-in DSP runs on the graph thread; JUCE already uses
+/// `ScopedNoDenormals` for VST processing. MXCSR is thread-local, so setting
+/// it here leaves the rest of the process (and the UI) untouched.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[inline]
+fn enable_ftz_daz() {
+    // SAFETY: MXCSR is thread-local; `stmxcsr`/`ldmxcsr` only access the
+    // provided stack slot and the FP control state of this thread.
+    unsafe {
+        const FTZ: u32 = 1 << 15;
+        const DAZ: u32 = 1 << 6;
+        let mut csr: u32 = 0;
+        core::arch::asm!(
+            "stmxcsr [{slot}]",
+            slot = in(reg) &mut csr,
+            options(nostack, preserves_flags)
+        );
+        csr |= FTZ | DAZ;
+        core::arch::asm!(
+            "ldmxcsr [{slot}]",
+            slot = in(reg) &csr,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+#[inline]
+fn enable_ftz_daz() {}
+
 fn graph_loop(state: GraphState) {
     let _priority = AudioThreadPriority::acquire();
+    enable_ftz_daz();
     let GraphState {
         mut engine,
         mut engine_rx,
@@ -1269,13 +1335,19 @@ fn graph_loop(state: GraphState) {
     let block_period = block_size as f64 / engine_rate;
     let mut cpu_window_time = 0.0f64;
     let mut cpu_window_period = 0.0f64;
+    // Retired engines/plugin handles must be dropped on the UI thread. When
+    // the handoff ring is full, keep at most one in this bounded slot and try
+    // again next iteration instead of forgetting it on the audio thread.
+    let mut pending_engine: Option<ChainEngine> = None;
+    let mut pending_monitor: Option<MonitorRetired> = None;
 
     while !stop.load(Ordering::Acquire) {
+        drain_pending_retire(&mut retired_tx, &mut pending_engine);
+        drain_pending_monitor(&mut monitor_retired_tx, &mut pending_monitor);
+
         while let Ok(next) = engine_rx.pop() {
             let previous = std::mem::replace(&mut engine, next);
-            if let Err(rtrb::PushError::Full(previous)) = retired_tx.push(previous) {
-                std::mem::forget(previous);
-            }
+            retire_engine(&mut retired_tx, &mut pending_engine, previous);
         }
         while let Ok(update) = monitor_rx.pop() {
             match update {
@@ -1286,7 +1358,7 @@ fn graph_loop(state: GraphState) {
                     capacity,
                 } => {
                     if let Some(previous) = monitor_producers.replace(producers) {
-                        retire_monitor(&mut monitor_retired_tx, previous);
+                        retire_monitor(&mut monitor_retired_tx, &mut pending_monitor, previous);
                     }
                     monitor_rate = rate;
                     monitor_target = target.max(1);
@@ -1503,6 +1575,8 @@ fn graph_loop(state: GraphState) {
         );
         frames.fetch_add(block_size as u64, Ordering::Relaxed);
     }
+    flush_pending_retire(&mut retired_tx, &mut pending_engine);
+    flush_pending_monitor(&mut monitor_retired_tx, &mut pending_monitor);
 }
 
 fn vmic_loop(
@@ -1603,13 +1677,91 @@ impl Drop for PumpTimer {
     }
 }
 
+/// Moves a retired engine to the UI-owned ring, or parks it in the bounded
+/// pending slot. Only when a second retirement arrives while the slot is
+/// occupied and the ring is full is one forgotten as a last resort.
+fn retire_engine(
+    sender: &mut rtrb::Producer<ChainEngine>,
+    pending: &mut Option<ChainEngine>,
+    engine: ChainEngine,
+) {
+    let Some(held) = pending.take() else {
+        *pending = Some(engine);
+        return;
+    };
+    match sender.push(held) {
+        Ok(()) => *pending = Some(engine),
+        Err(rtrb::PushError::Full(held)) => {
+            std::mem::forget(held);
+            *pending = Some(engine);
+        }
+    }
+}
+
+fn drain_pending_retire(
+    sender: &mut rtrb::Producer<ChainEngine>,
+    pending: &mut Option<ChainEngine>,
+) {
+    if let Some(engine) = pending.take()
+        && let Err(rtrb::PushError::Full(engine)) = sender.push(engine)
+    {
+        *pending = Some(engine);
+    }
+}
+
 fn retire_monitor(
     sender: &mut rtrb::Producer<MonitorRetired>,
+    pending: &mut Option<MonitorRetired>,
     producers: Vec<rtrb::Producer<f32>>,
 ) {
-    if let Err(rtrb::PushError::Full(retired)) = sender.push(MonitorRetired {
+    let retired = MonitorRetired {
         _producers: producers,
-    }) {
+    };
+    let Some(held) = pending.take() else {
+        *pending = Some(retired);
+        return;
+    };
+    match sender.push(held) {
+        Ok(()) => *pending = Some(retired),
+        Err(rtrb::PushError::Full(held)) => {
+            std::mem::forget(held);
+            *pending = Some(retired);
+        }
+    }
+}
+
+fn drain_pending_monitor(
+    sender: &mut rtrb::Producer<MonitorRetired>,
+    pending: &mut Option<MonitorRetired>,
+) {
+    if let Some(retired) = pending.take()
+        && let Err(rtrb::PushError::Full(retired)) = sender.push(retired)
+    {
+        *pending = Some(retired);
+    }
+}
+
+/// Last-resort flush after the stop flag is set. The UI may already have
+/// stopped draining, so a full ring leaks one object rather than dropping a
+/// plugin handle on the graph thread.
+fn flush_pending_retire(
+    sender: &mut rtrb::Producer<ChainEngine>,
+    pending: &mut Option<ChainEngine>,
+) {
+    if let Some(engine) = pending.take()
+        && let Err(rtrb::PushError::Full(engine)) = sender.push(engine)
+    {
+        std::mem::forget(engine);
+    }
+}
+
+fn flush_pending_monitor(
+    sender: &mut rtrb::Producer<MonitorRetired>,
+    pending: &mut Option<MonitorRetired>,
+) {
+    if let Some(retired) = pending.take()
+        && let Err(rtrb::PushError::Full(retired)) = sender.push(retired)
+    {
         std::mem::forget(retired);
     }
 }

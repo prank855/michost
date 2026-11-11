@@ -46,6 +46,20 @@ pub fn clear_startup_progress() {
     }
 }
 
+/// Splits the backend's reported device latency into device and buffer parts.
+///
+/// JUCE folds one buffer into the WASAPI input/output latency
+/// (`latencySamples + currentBufferSizeSamples`), while ASIO reports the
+/// driver latency without the host buffer. Adding the buffer back for both
+/// would double-count one period per WASAPI direction.
+fn device_latency_parts(api: AudioApi, device: u32, buffer: u32) -> (u32, u32) {
+    if api == AudioApi::Asio {
+        (device, buffer)
+    } else {
+        (device.saturating_sub(buffer), buffer)
+    }
+}
+
 pub struct LoadedPlugin {
     pub entry_id: u64,
     pub handle: Option<PluginHandle>,
@@ -77,6 +91,7 @@ pub struct PreparedPlugin {
     pub latency_samples: u32,
     pub memory_bytes: Option<u64>,
     pub meter: Arc<PluginMeter>,
+    pub oversampling: u8,
 }
 
 pub struct EndpointInfo {
@@ -86,6 +101,13 @@ pub struct EndpointInfo {
     pub sample_rate: f64,
     pub buffer_size: u32,
     pub latency: DeviceLatency,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EndpointRefresh {
+    pub changed: bool,
+    pub rate_changed: bool,
+    pub buffer_changed: bool,
 }
 
 pub struct LatencyBreakdown {
@@ -189,7 +211,7 @@ impl AudioSession {
         }
 
         let requested_input_channels = settings.input.channels.clamp(1, 8);
-        let input_channels = if mono_source == Some(1) {
+        let input_channels = if mono_source == Some(1) && settings.input.channel_mask == 0 {
             requested_input_channels.max(2)
         } else {
             requested_input_channels
@@ -818,7 +840,7 @@ impl AudioSession {
                 } else {
                     SidechainSource::Off
                 },
-                oversampling: 1,
+                oversampling: plugin.oversampling,
             });
             provisional = true;
         }
@@ -827,6 +849,7 @@ impl AudioSession {
             if provisional {
                 self.chain.retain(|entry| entry.id != entry_id);
             }
+            self.retire_loaded(entry_id);
             return Err(format!("publishing the chain after inserting: {error}"));
         }
         Ok(())
@@ -845,7 +868,11 @@ impl AudioSession {
             ));
         }
         self.register_prepared(entry_id, prepared)?;
-        self.publish_chain(project.chain.clone())
+        if let Err(error) = self.publish_chain(project.chain.clone()) {
+            self.retire_loaded(entry_id);
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn retire_plugin(&mut self, entry_id: u64) {
@@ -900,7 +927,9 @@ impl AudioSession {
             latency_samples,
             memory_bytes,
             meter,
+            oversampling,
         } = prepared;
+        let oversampling = michost_graph::normalize_oversampling(oversampling);
         self.plugins.push(LoadedPlugin {
             entry_id,
             handle: Some(handle),
@@ -910,12 +939,27 @@ impl AudioSession {
             main_outputs,
             native_sidechain,
             active_sidechain,
-            latency: latency_samples,
+            latency: plugin_latency_engine(latency_samples, oversampling),
             memory_bytes,
             meter,
-            oversampling: 1,
+            oversampling,
         });
         Ok(())
+    }
+
+    /// Unregisters a prepared plugin whose chain could not be published. The
+    /// instance is kept in `retired` (never freed here) so a UI-thread drop
+    /// owns its destruction; without this the plugin would stay loaded and
+    /// could not be removed from the UI.
+    fn retire_loaded(&mut self, entry_id: u64) {
+        if let Some(index) = self
+            .plugins
+            .iter()
+            .position(|plugin| plugin.entry_id == entry_id)
+        {
+            let plugin = self.plugins.remove(index);
+            self.retired.push(plugin);
+        }
     }
 
     pub fn insert_builtin_with_project(
@@ -1060,6 +1104,69 @@ impl AudioSession {
         }
         ChainEngine::new(plan, processors, self.block_size as usize)
             .map_err(|error| error.to_string())
+    }
+
+    pub fn refresh_endpoints(&mut self) -> Result<EndpointRefresh, String> {
+        let Some(bridge) = self.bridge.as_ref() else {
+            return Ok(EndpointRefresh::default());
+        };
+        let (input, second, output) = bridge.endpoint_latencies()?;
+        let mut refresh = EndpointRefresh::default();
+
+        if input.sample_rate != 0 {
+            let old = self.input.latency;
+            if input.sample_rate != old.sample_rate {
+                refresh.rate_changed = true;
+            }
+            if input.buffer != old.buffer {
+                refresh.buffer_changed = true;
+            }
+            if input != old {
+                refresh.changed = true;
+                self.input.latency = input;
+                self.input.buffer_size = input.buffer;
+                self.input.sample_rate = input.sample_rate as f64;
+            }
+        }
+
+        if let (Some(info), Some(latency)) = (self.second_input.as_mut(), second)
+            && latency.sample_rate != 0
+        {
+            let old = info.latency;
+            if latency.sample_rate != old.sample_rate {
+                refresh.rate_changed = true;
+            }
+            if latency.buffer != old.buffer {
+                refresh.buffer_changed = true;
+            }
+            if latency != old {
+                refresh.changed = true;
+                info.latency = latency;
+                info.buffer_size = latency.buffer;
+                info.sample_rate = latency.sample_rate as f64;
+            }
+        }
+
+        if !self.virtual_mic_active
+            && let Some(latency) = output
+            && latency.sample_rate != 0
+        {
+            let old = self.output.latency;
+            if latency.sample_rate != old.sample_rate {
+                refresh.rate_changed = true;
+            }
+            if latency.buffer != old.buffer {
+                refresh.buffer_changed = true;
+            }
+            if latency != old {
+                refresh.changed = true;
+                self.output.latency = latency;
+                self.output.buffer_size = latency.buffer;
+                self.output.sample_rate = latency.sample_rate as f64;
+            }
+        }
+
+        Ok(refresh)
     }
 
     pub fn refresh_latencies(&mut self) -> Result<bool, String> {
@@ -1362,12 +1469,21 @@ impl AudioSession {
         if self.sample_rate <= 0.0 || self.output.sample_rate <= 0.0 {
             return 0.0;
         }
-        let input_ms = (self.input.latency.input + self.input.latency.buffer) as f64 * 1000.0
-            / self.input.sample_rate.max(1.0);
+        let (input_device, input_buffer) = device_latency_parts(
+            self.input.api,
+            self.input.latency.input,
+            self.input.latency.buffer,
+        );
+        let (output_device, output_buffer) = device_latency_parts(
+            self.output.api,
+            self.output.latency.output,
+            self.output.latency.buffer,
+        );
+        let input_ms =
+            (input_device + input_buffer) as f64 * 1000.0 / self.input.sample_rate.max(1.0);
         let graph_ms =
             (self.block_size as f64 + self.total_latency as f64) * 1000.0 / self.sample_rate;
-        let output_ms = (self.output.latency.output + self.output.latency.buffer) as f64 * 1000.0
-            / self.output.sample_rate;
+        let output_ms = (output_device + output_buffer) as f64 * 1000.0 / self.output.sample_rate;
         input_ms + graph_ms + output_ms
     }
 
@@ -1380,12 +1496,22 @@ impl AudioSession {
         let input_rate = self.input.sample_rate.max(1.0);
         let output_rate = self.output.sample_rate.max(1.0);
         let engine_rate = self.sample_rate.max(1.0);
-        let input_device_ms = self.input.latency.input as f64 * 1000.0 / input_rate;
-        let input_buffer_ms = self.input.latency.buffer as f64 * 1000.0 / input_rate;
+        let (input_device, input_buffer) = device_latency_parts(
+            self.input.api,
+            self.input.latency.input,
+            self.input.latency.buffer,
+        );
+        let input_device_ms = input_device as f64 * 1000.0 / input_rate;
+        let input_buffer_ms = input_buffer as f64 * 1000.0 / input_rate;
         let graph_ms = self.block_size as f64 * 1000.0 / engine_rate;
         let chain_ms = self.total_latency as f64 * 1000.0 / engine_rate;
-        let output_device_ms = self.output.latency.output as f64 * 1000.0 / output_rate;
-        let output_buffer_ms = self.output.latency.buffer as f64 * 1000.0 / output_rate;
+        let (output_device, output_buffer) = device_latency_parts(
+            self.output.api,
+            self.output.latency.output,
+            self.output.latency.buffer,
+        );
+        let output_device_ms = output_device as f64 * 1000.0 / output_rate;
+        let output_buffer_ms = output_buffer as f64 * 1000.0 / output_rate;
         let output_queue_ms = self.output_target as f64 * 1000.0 / output_rate;
         LatencyBreakdown {
             input_device_ms,
@@ -1773,6 +1899,38 @@ pub fn prepare_plugin_for_insert(
     sidechain_channels: u16,
     state: Option<&[u8]>,
 ) -> Result<PreparedPlugin, String> {
+    prepare_plugin_for_insert_with_oversampling(
+        backend,
+        path,
+        class_id,
+        name,
+        sample_rate,
+        block_size,
+        1,
+        sidechain_channels,
+        state,
+    )
+}
+
+/// Prepares a plugin for a live hot-swap insert at the graph rate and block of
+/// the chain entry it will replace. `sample_rate` and `block_size` are the
+/// engine values; the instance is prepared at the oversampled rate/block so it
+/// matches the wrapper the engine builds for that entry.
+#[allow(clippy::too_many_arguments)]
+pub fn prepare_plugin_for_insert_with_oversampling(
+    backend: Arc<JuceBackend>,
+    path: &str,
+    class_id: &str,
+    name: &str,
+    sample_rate: f64,
+    block_size: u32,
+    oversampling: u8,
+    sidechain_channels: u16,
+    state: Option<&[u8]>,
+) -> Result<PreparedPlugin, String> {
+    let oversampling = michost_graph::normalize_oversampling(oversampling);
+    let graph_rate = sample_rate * f64::from(oversampling);
+    let graph_block = block_size.saturating_mul(u32::from(oversampling));
     let started = Instant::now();
     let memory_before = process_memory_bytes();
     let handle = backend
@@ -1795,8 +1953,8 @@ pub fn prepare_plugin_for_insert(
     let prepare_started = Instant::now();
     if let Err(error) = backend.prepare_plugin(
         handle,
-        sample_rate,
-        block_size,
+        graph_rate,
+        graph_block,
         native.main_inputs as u32,
         native.main_outputs as u32,
         active_sidechain as u32,
@@ -1805,8 +1963,8 @@ pub fn prepare_plugin_for_insert(
             active_sidechain = 0;
             if let Err(error) = backend.prepare_plugin(
                 handle,
-                sample_rate,
-                block_size,
+                graph_rate,
+                graph_block,
                 native.main_inputs as u32,
                 native.main_outputs as u32,
                 0,
@@ -1854,8 +2012,9 @@ pub fn prepare_plugin_for_insert(
         _ => None,
     };
     logging::line(format!(
-        "audio session: prepared '{name}' in {:.1} ms (load {load_ms:.1} ms, prepare {prepare_ms:.1} ms)",
-        started.elapsed().as_secs_f64() * 1000.0
+        "audio session: prepared '{name}' in {:.1} ms ({}x; load {load_ms:.1} ms, prepare {prepare_ms:.1} ms)",
+        started.elapsed().as_secs_f64() * 1000.0,
+        oversampling
     ));
     Ok(PreparedPlugin {
         handle,
@@ -1867,6 +2026,7 @@ pub fn prepare_plugin_for_insert(
         latency_samples,
         memory_bytes,
         meter: Arc::new(PluginMeter::new()),
+        oversampling,
     })
 }
 
@@ -1947,4 +2107,31 @@ fn build_plan(
     let mut plan = ChainPlan::from_nodes(nodes, block_size);
     plan.set_processing_options(sample_rate, mono_source);
     plan
+}
+
+#[cfg(test)]
+mod tests {
+    use super::device_latency_parts;
+    use michost_host_abi::AudioApi;
+
+    #[test]
+    fn wasapi_latency_does_not_add_the_buffer_twice() {
+        assert_eq!(
+            device_latency_parts(AudioApi::WasapiExclusive, 441, 441),
+            (0, 441)
+        );
+        assert_eq!(
+            device_latency_parts(AudioApi::WasapiShared, 960, 441),
+            (519, 441)
+        );
+        assert_eq!(
+            device_latency_parts(AudioApi::WasapiLowLatency, 128, 441),
+            (0, 441)
+        );
+    }
+
+    #[test]
+    fn asio_latency_keeps_the_host_buffer() {
+        assert_eq!(device_latency_parts(AudioApi::Asio, 320, 64), (320, 64));
+    }
 }

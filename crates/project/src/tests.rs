@@ -209,17 +209,20 @@ fn plugin_ids_advance_and_prune() {
     assert_eq!(Project::new().next_plugin_id(), 1);
 }
 
-#[test]
-fn remove_builtin_entries_drops_effects_and_state() {
-    let mut project = sample_project();
-    let builtin = ChainEntry {
-        id: 10,
-        plugin: PluginSpec::new("builtin:eq", "builtin.eq", "EQ", "MicHost"),
+fn builtin_entry(id: u64, path: &str, name: &str) -> ChainEntry {
+    ChainEntry {
+        id,
+        plugin: PluginSpec::new(path, "builtin.eq", name, "MicHost"),
         bypassed: false,
         sidechain_source: SidechainSource::Off,
         oversampling: 1,
-    };
-    project.chain.push(builtin);
+    }
+}
+
+#[test]
+fn remove_builtin_entries_drops_effects_and_state() {
+    let mut project = sample_project();
+    project.chain.push(builtin_entry(10, "builtin:eq", "EQ"));
     project.set_plugin_state(10, vec![1, 2, 3]);
     project.set_plugin_state(2, vec![4]);
 
@@ -229,6 +232,44 @@ fn remove_builtin_entries_drops_effects_and_state() {
     assert!(project.chain.iter().all(|entry| entry.id != 10));
     assert!(project.plugin_state(10).is_none());
     assert!(project.plugin_state(2).is_some());
+}
+
+#[test]
+fn remove_builtin_entries_accepts_bare_ids_and_keeps_vst3() {
+    let mut project = Project::new();
+    project.chain.push(builtin_entry(10, "eq", "Bare EQ"));
+    project
+        .chain
+        .push(builtin_entry(11, "builtin:eq", "Prefixed EQ"));
+    project
+        .chain
+        .push(plugin(12, "CABLE-EQ", false, SidechainSource::Off));
+    project.set_plugin_state(10, vec![1]);
+    project.set_plugin_state(11, vec![2]);
+    project.set_plugin_state(12, vec![3]);
+
+    let removed = project.remove_builtin_entries();
+
+    assert_eq!(
+        removed,
+        vec!["Bare EQ".to_string(), "Prefixed EQ".to_string()]
+    );
+    assert_eq!(project.chain.len(), 1);
+    assert_eq!(project.chain[0].id, 12);
+    assert!(project.plugin_state(10).is_none());
+    assert!(project.plugin_state(11).is_none());
+    assert!(project.plugin_state(12).is_some());
+}
+
+#[test]
+fn remove_builtin_entries_leaves_non_builtin_paths_alone() {
+    let mut project = Project::new();
+    project
+        .chain
+        .push(plugin(1, "Pro-Q 4", false, SidechainSource::Off));
+
+    assert!(project.remove_builtin_entries().is_empty());
+    assert_eq!(project.chain.len(), 1);
 }
 
 #[test]

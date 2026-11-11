@@ -8,7 +8,10 @@
 
 use std::sync::Arc;
 
-use crate::dsp_util::{EnvelopeFollower, OnePole, db_to_gain, gain_to_db, smoothing_coefficient};
+use crate::dsp_util::{
+    EnvelopeFollower, OnePole, db_to_gain, fast_db_to_gain, fast_gain_to_db, gain_to_db,
+    smoothing_coefficient,
+};
 use crate::{AudioAnalysis, BuiltinDsp, ParamCurve, ParamSet, ParamSpec, ParamStyle};
 
 pub static SPECS: &[ParamSpec] = &[
@@ -152,6 +155,7 @@ impl NoiseFloor {
         }
     }
 
+    #[cfg(test)]
     fn update(&mut self, level_db: f32) {
         if level_db < self.window_min {
             self.window_min = level_db;
@@ -166,6 +170,34 @@ impl NoiseFloor {
         } else {
             FLOOR_MIN_DB
         };
+        self.finish_window(value);
+    }
+
+    /// Linear-domain variant for the audio path: only one `gain_to_db` per
+    /// 50 ms window, instead of one per sample.
+    fn update_linear(&mut self, level: f32) {
+        let level = if level.is_finite() {
+            level.max(0.0)
+        } else {
+            0.0
+        };
+        if level < self.window_min {
+            self.window_min = level;
+        }
+        self.window_samples += 1;
+        if self.window_samples < self.window_limit {
+            return;
+        }
+
+        let value = if self.window_min.is_finite() {
+            gain_to_db(self.window_min).clamp(FLOOR_MIN_DB, FLOOR_MAX_DB)
+        } else {
+            FLOOR_MIN_DB
+        };
+        self.finish_window(value);
+    }
+
+    fn finish_window(&mut self, value: f32) {
         self.windows[self.write] = value;
         self.write = (self.write + 1) % FLOOR_HISTORY;
         self.window_min = f32::INFINITY;
@@ -251,6 +283,13 @@ impl BuiltinDsp for Dsp {
         let closed_gain = db_to_gain(-range);
         let slope = (ratio - 1.0).max(0.0);
         let hold_samples = (f64::from(hold_ms) * 0.001 * self.sample_rate).round() as u32;
+        // Cached linear thresholds; recomputed only when the learned floor
+        // changes (one 50 ms window), not per sample.
+        let mut cached_floor = u32::MAX;
+        let mut threshold_db = 0.0f32;
+        let mut threshold_gain = 1.0f32;
+        let mut close_gain = 1.0f32;
+        let mut fully_closed_gain = 0.0f32;
 
         self.detector
             .set_times(attack_ms, release_ms, self.sample_rate);
@@ -272,23 +311,32 @@ impl BuiltinDsp for Dsp {
         for (l, r) in left.iter_mut().zip(right.iter_mut()) {
             let linked = l.abs().max(r.abs());
             let level = self.detector.process(linked);
-            let level_db = gain_to_db(level);
             if !self.floor_primed {
                 self.floor_detector.set_value(linked);
                 self.floor_primed = true;
             }
-            self.floor
-                .update(gain_to_db(self.floor_detector.process(linked)));
-            let threshold = (self.floor.value_db() + offset).clamp(FLOOR_MIN_DB, FLOOR_MAX_DB);
-            let close_threshold = threshold - hysteresis;
+            let floor_level = self.floor_detector.process(linked);
+            self.floor.update_linear(floor_level);
+            let floor_db = self.floor.value_db();
+            if floor_db.to_bits() != cached_floor {
+                cached_floor = floor_db.to_bits();
+                threshold_db = (floor_db + offset).clamp(FLOOR_MIN_DB, FLOOR_MAX_DB);
+                threshold_gain = db_to_gain(threshold_db);
+                close_gain = db_to_gain(threshold_db - hysteresis);
+                fully_closed_gain = if slope > 0.0 {
+                    threshold_gain * db_to_gain(-range / slope)
+                } else {
+                    0.0
+                };
+            }
 
-            if !self.open && level_db > threshold {
+            if !self.open && level > threshold_gain {
                 self.open = true;
                 self.hold = hold_samples;
             }
 
             if self.open {
-                if level_db < close_threshold {
+                if level < close_gain {
                     if self.hold > 0 {
                         self.hold -= 1;
                     } else {
@@ -299,14 +347,17 @@ impl BuiltinDsp for Dsp {
                 }
             }
 
-            let target = if self.open {
+            let target = if self.open || slope <= 0.0 {
                 1.0
+            } else if level <= fully_closed_gain {
+                closed_gain
             } else {
-                let depth = (threshold - level_db).max(0.0);
+                let level_db = fast_gain_to_db(level);
+                let depth = (threshold_db - level_db).max(0.0);
                 let target_db = -(depth * slope).min(range);
                 if (target_db - self.target_db).abs() > 0.05 {
                     self.target_db = target_db;
-                    self.target_gain = db_to_gain(target_db);
+                    self.target_gain = fast_db_to_gain(target_db);
                 }
                 self.target_gain
             };

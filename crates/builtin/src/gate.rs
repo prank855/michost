@@ -5,7 +5,9 @@
 //! `threshold - hysteresis`, after holding for the configured time. The applied
 //! gain glides to `-range` dB while closed so the floor never jumps.
 
-use crate::dsp_util::{EnvelopeFollower, OnePole, db_to_gain, gain_to_db, smoothing_coefficient};
+use crate::dsp_util::{
+    EnvelopeFollower, OnePole, db_to_gain, fast_db_to_gain, fast_gain_to_db, smoothing_coefficient,
+};
 use crate::{BuiltinDsp, ParamCurve, ParamSet, ParamSpec, ParamStyle};
 
 pub static SPECS: &[ParamSpec] = &[
@@ -179,6 +181,15 @@ impl BuiltinDsp for Dsp {
         let closed_gain = db_to_gain(-range);
         let slope = (ratio - 1.0).max(0.0);
         let hold_samples = (f64::from(hold_ms) * 0.001 * self.sample_rate).round() as u32;
+        // Threshold comparisons stay in the linear domain; only this block
+        // (and a floor change in the dynamic gate) pays for db_to_gain.
+        let threshold_gain = db_to_gain(threshold);
+        let close_gain = db_to_gain(close_threshold);
+        let fully_closed_gain = if slope > 0.0 {
+            threshold_gain * db_to_gain(-range / slope)
+        } else {
+            0.0
+        };
 
         self.detector
             .set_times(attack_ms, release_ms, self.sample_rate);
@@ -197,15 +208,14 @@ impl BuiltinDsp for Dsp {
         for (l, r) in left.iter_mut().zip(right.iter_mut()) {
             let linked = l.abs().max(r.abs());
             let level = self.detector.process(linked);
-            let level_db = gain_to_db(level);
 
-            if !self.open && level_db > threshold {
+            if !self.open && level > threshold_gain {
                 self.open = true;
                 self.hold = hold_samples;
             }
 
             if self.open {
-                if level_db < close_threshold {
+                if level < close_gain {
                     if self.hold > 0 {
                         self.hold -= 1;
                     } else {
@@ -216,14 +226,17 @@ impl BuiltinDsp for Dsp {
                 }
             }
 
-            let target = if self.open {
+            let target = if self.open || slope <= 0.0 {
                 1.0
+            } else if level <= fully_closed_gain {
+                closed_gain
             } else {
+                let level_db = fast_gain_to_db(level);
                 let depth = (threshold - level_db).max(0.0);
                 let target_db = -(depth * slope).min(range);
                 if (target_db - self.target_db).abs() > 0.05 {
                     self.target_db = target_db;
-                    self.target_gain = db_to_gain(target_db);
+                    self.target_gain = fast_db_to_gain(target_db);
                 }
                 self.target_gain
             };

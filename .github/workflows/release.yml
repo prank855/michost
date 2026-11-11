@@ -120,6 +120,13 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      - name: Build stamp
+        shell: pwsh
+        run: |
+          "MICHOST_BUILD_TIME=$((Get-Date).ToUniversalTime().ToString("yyyyMMdd'T'HHmmss'Z'"))" >> $env:GITHUB_ENV
+          "MICHOST_GIT_HASH=$((git rev-parse --short=8 HEAD))" >> $env:GITHUB_ENV
+          "MICHOST_GIT_DIRTY=0" >> $env:GITHUB_ENV
+
       - name: Build
         shell: pwsh
         run: pwsh -NoProfile -File scripts/build.ps1 -Configuration Release -AsioDir "$env:ASIOSDK_DIR"
@@ -130,6 +137,7 @@ jobs:
           pwsh -NoProfile -File scripts/package.ps1 `
             -Configuration Release `
             -Version "${{ needs.check.outputs.version }}" `
+            -NoBuildStamp `
             -SkipBuild
 
       - name: Write checksum
@@ -155,7 +163,7 @@ jobs:
           body: |
             ## Download
 
-            Download `MicHost-${{ needs.check.outputs.version }}.zip` from the **Assets** section below, extract it, and run `michost.exe`.
+            Download `MicHost-${{ needs.check.outputs.version }}.zip` from the **Assets** section below, extract it, and run `Install.cmd` for a per-user install with a Start Menu shortcut, or run `michost.exe` directly.
 
             Windows SmartScreen may warn because the build is not code-signed.
 

@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use michost_graph::PluginProcessor;
 
@@ -81,11 +82,16 @@ pub trait HostBackend: StreamHost + PluginHost {
 pub struct BackendProcessor {
     host: Arc<dyn PluginHost>,
     handle: PluginHandle,
+    failed: AtomicBool,
 }
 
 impl BackendProcessor {
     pub fn new(host: Arc<dyn PluginHost>, handle: PluginHandle) -> Self {
-        Self { host, handle }
+        Self {
+            host,
+            handle,
+            failed: AtomicBool::new(false),
+        }
     }
 
     pub fn host(&self) -> &Arc<dyn PluginHost> {
@@ -95,10 +101,23 @@ impl BackendProcessor {
     pub fn handle(&self) -> PluginHandle {
         self.handle
     }
+
+    /// Returns whether processing this instance failed since the last call.
+    /// A plugin that fails process must stay a per-instance problem: callers
+    /// surface it as a plugin warning and never as a device error/restart.
+    pub fn take_failure(&self) -> bool {
+        self.failed.swap(false, Ordering::AcqRel)
+    }
 }
 
 impl PluginProcessor for BackendProcessor {
     fn process(&mut self, channels: &mut [&mut [f32]], frames: usize) {
-        let _ = self.host.process_plugin(self.handle, channels, frames);
+        if self
+            .host
+            .process_plugin(self.handle, channels, frames)
+            .is_err()
+        {
+            self.failed.store(true, Ordering::Release);
+        }
     }
 }

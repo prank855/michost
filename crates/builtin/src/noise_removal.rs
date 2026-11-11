@@ -204,6 +204,7 @@ impl BuiltinDsp for Dsp {
         let mix_target = (params.get(3) / 100.0).clamp(0.0, 1.0);
         let low_cut = params.get(4).clamp(20.0, 300.0);
         self.retune_low_cut(low_cut);
+        let bypass = spectral::is_bypass(params);
 
         for index in 0..frames {
             let dry_l = sanitize(left[index]);
@@ -241,8 +242,10 @@ impl BuiltinDsp for Dsp {
             params,
         );
 
-        // Mix 0 is a dry monitor path; do not let the gate modulate it.
-        let gate_amount = if mix_target <= 0.001 {
+        // Mix 0 is a dry monitor path; do not let the gate modulate it. The
+        // same applies when suppression is bypassed: the STFT is skipped and
+        // its speech activity is not meaningful.
+        let gate_amount = if mix_target <= 0.001 || bypass {
             0.0
         } else {
             (params.get_key("gate") / 100.0).clamp(0.0, 1.0)

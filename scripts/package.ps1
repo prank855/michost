@@ -3,10 +3,11 @@ param(
     [ValidateSet("Debug", "Release")]
     [string]$Configuration = "Release",
     [ValidatePattern("^[0-9A-Za-z]([0-9A-Za-z._+-]*[0-9A-Za-z])?$")]
-    [string]$Version = "0.1.0",
+    [string]$Version = "0.2.0",
     [string]$OutputDir = "target\dist",
     [switch]$SkipBuild,
-    [switch]$IncludeDriver
+    [switch]$IncludeDriver,
+    [switch]$NoBuildStamp
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,14 +15,21 @@ $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $profileName = if ($Configuration -eq "Debug") { "debug" } else { "release" }
 $targetDir = Join-Path $root "target\$profileName"
-$stageName = if ($Configuration -eq "Release") { "MicHost-$Version" } else { "MicHost-$Version-$Configuration" }
-$outputPath = if ([System.IO.Path]::IsPathRooted($OutputDir)) {
-    [System.IO.Path]::GetFullPath($OutputDir)
-} else {
-    [System.IO.Path]::GetFullPath((Join-Path $root $OutputDir))
+
+function Read-BuildStamp([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $null
+    }
+    try {
+        $stamp = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    } catch {
+        throw "Could not read the build stamp '$Path': $($_.Exception.Message)"
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$stamp.build_version)) {
+        throw "The build stamp '$Path' has no build_version. Rebuild with scripts/build.ps1."
+    }
+    return $stamp
 }
-$stageDir = Join-Path $outputPath $stageName
-$zipPath = Join-Path $outputPath "$stageName.zip"
 
 function Trim-DirectorySeparators([string]$Path) {
     return $Path.TrimEnd([char[]]@('\', '/'))
@@ -63,12 +71,62 @@ if (-not $SkipBuild) {
         throw "Build script not found: $buildScript"
     }
     Write-Host "Building $Configuration via $buildScript"
+    $buildArgs = @{ Configuration = $Configuration }
+    if ($PSBoundParameters.ContainsKey("Version")) {
+        $buildArgs["Version"] = $Version
+    }
     $global:LASTEXITCODE = 0
-    & $buildScript -Configuration $Configuration
+    & $buildScript @buildArgs
     if ($LASTEXITCODE -ne 0) {
         throw "Build failed with exit code $LASTEXITCODE"
     }
 }
+
+$stampPath = Join-Path $targetDir "build-stamp.json"
+$stamp = Read-BuildStamp $stampPath
+if ($null -ne $stamp) {
+    $buildVersion = [string]$stamp.build_version
+    $buildTimeUtc = [string]$stamp.build_time
+    $gitHash = [string]$stamp.git_hash
+    $gitDirty = [bool]$stamp.git_dirty
+    Write-Host "Using the build stamp from $stampPath"
+} elseif (-not [string]::IsNullOrWhiteSpace($env:MICHOST_BUILD_VERSION)) {
+    $buildVersion = $env:MICHOST_BUILD_VERSION
+    $buildTimeUtc = [string]$env:MICHOST_BUILD_TIME
+    $gitHash = [string]$env:MICHOST_GIT_HASH
+    $gitDirty = $env:MICHOST_GIT_DIRTY -eq "1"
+    Write-Host "Using MICHOST_BUILD_VERSION from the environment; no persisted build stamp was found."
+} elseif ($SkipBuild) {
+    throw ("package.ps1 -SkipBuild found no build stamp. Run scripts/build.ps1 -Configuration $Configuration " +
+        "first (it writes '$stampPath'), or set MICHOST_BUILD_VERSION, then run -SkipBuild again.")
+} else {
+    throw "scripts/build.ps1 did not write the build stamp '$stampPath'. Rebuild and try again."
+}
+if ([string]::IsNullOrWhiteSpace($buildTimeUtc)) { $buildTimeUtc = "unknown" }
+if ([string]::IsNullOrWhiteSpace($gitHash)) { $gitHash = "nogit" }
+
+if (-not $PSBoundParameters.ContainsKey("Version") -and
+    $null -ne $stamp -and
+    -not [string]::IsNullOrWhiteSpace([string]$stamp.version)) {
+    $Version = [string]$stamp.version
+}
+
+$stampSuffix = "${buildTimeUtc}-${gitHash}"
+if ($gitDirty) {
+    $stampSuffix += "-dirty"
+}
+$stageVersion = $Version
+if (-not $NoBuildStamp) {
+    $stageVersion = "${Version}-" + [regex]::Replace($stampSuffix, "[^0-9A-Za-z._-]", "-")
+}
+$stageName = if ($Configuration -eq "Release") { "MicHost-$stageVersion" } else { "MicHost-$stageVersion-$Configuration" }
+$outputPath = if ([System.IO.Path]::IsPathRooted($OutputDir)) {
+    [System.IO.Path]::GetFullPath($OutputDir)
+} else {
+    [System.IO.Path]::GetFullPath((Join-Path $root $OutputDir))
+}
+$stageDir = Join-Path $outputPath $stageName
+$zipPath = Join-Path $outputPath "$stageName.zip"
 
 $requiredArtifacts = @(
     (Join-Path $targetDir "michost.exe"),
@@ -80,6 +138,14 @@ if ($missing.Count -gt 0) {
     $list = ($missing | ForEach-Object { "  - $_" }) -join [Environment]::NewLine
     throw ("Missing $Configuration build artifacts. Build with scripts/build.ps1 -Configuration $Configuration, " +
         "or pass -Configuration Debug. Missing:" + [Environment]::NewLine + $list)
+}
+
+$installerSource = Join-Path $root "scripts\install.ps1"
+$installCmdSource = Join-Path $root "scripts\Install.cmd"
+foreach ($installerFile in @($installerSource, $installCmdSource)) {
+    if (-not (Test-Path -LiteralPath $installerFile -PathType Leaf)) {
+        throw "Installer file not found: $installerFile"
+    }
 }
 
 $manifestSource = Join-Path $root "packaging\michost.exe.manifest"
@@ -101,6 +167,8 @@ New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
 foreach ($artifact in $requiredArtifacts) {
     Copy-Item -LiteralPath $artifact -Destination (Join-Path $stageDir ([System.IO.Path]::GetFileName($artifact)))
 }
+Copy-Item -LiteralPath $installerSource -Destination (Join-Path $stageDir "install.ps1")
+Copy-Item -LiteralPath $installCmdSource -Destination (Join-Path $stageDir "Install.cmd")
 
 $vcRuntimeNames = @("VCRUNTIME140.dll", "VCRUNTIME140_1.dll", "MSVCP140.dll")
 $stagedRuntime = @()
@@ -192,9 +260,20 @@ $runtimeNote = if ($missingRuntime.Count -eq 0) {
     "  Install the redistributable before running michost.exe."
 }
 
+$dirtyText = if ($gitDirty) { " (dirty working tree)" } else { "" }
 $runText = @"
-MicHost $Version
+MicHost $buildVersion
 =============
+
+Build: $buildTimeUtc UTC, commit $gitHash$dirtyText
+
+Easy install (current user):
+  Double-click Install.cmd. It copies this folder to
+  %LOCALAPPDATA%\Programs\MicHost\<build>, adds one MicHost Start Menu
+  shortcut, and registers an uninstall entry
+  in Windows Settings > Apps. Add -VersionedShortcut for a second,
+  build-versioned shortcut when keeping several builds side by side.
+  Run Install.cmd -LaunchAtLogin to make this build start in the tray at login.
 
 Run:
   1. Keep michost.exe, michost-probe.exe and mic_host.dll together in this
@@ -226,6 +305,27 @@ Notices:
   embed it as a resource.
 "@
 [System.IO.File]::WriteAllText((Join-Path $stageDir "RUN.txt"), ($runText -replace "`r?`n", "`r`n"), $utf8NoBom)
+
+$builtDate = Get-Date
+try {
+    if ($buildTimeUtc -match '^\d{8}T\d{6}Z$') {
+        $builtDate = [datetime]::ParseExact($buildTimeUtc, "yyyyMMdd'T'HHmmss'Z'", [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AssumeUniversal)
+    } else {
+        $builtDate = [datetime]::Parse($buildTimeUtc, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::RoundtripKind)
+    }
+} catch {
+    $builtDate = (Get-Date).ToUniversalTime()
+}
+$buildInfo = [ordered]@{
+    version = $Version
+    build_version = $buildVersion
+    build_time = $buildTimeUtc
+    built_utc = $builtDate.ToUniversalTime().ToString("o")
+    git_commit = $gitHash
+    git_dirty = $gitDirty
+    configuration = $Configuration
+}
+[System.IO.File]::WriteAllText((Join-Path $stageDir "build-info.json"), ($buildInfo | ConvertTo-Json), $utf8NoBom)
 
 $tempZip = Join-Path $outputPath (".$stageName." + [guid]::NewGuid().ToString("N") + ".tmp.zip")
 Add-Type -AssemblyName System.IO.Compression | Out-Null
@@ -283,4 +383,6 @@ Write-Host "  Size : $(Format-Size $stageSize)"
 Write-Host "Zip    : $zipPath"
 Write-Host "  Size : $(Format-Size $zipSize) ($zipSize bytes)"
 Write-Host "  SHA256: $zipHash"
+Write-Host "Build  : $buildVersion"
+Write-Host "Commit : $gitHash$(if ($gitDirty) { ' (dirty)' } else { '' })"
 Write-Host "Manifest identity: $manifestVersion"

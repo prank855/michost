@@ -26,6 +26,8 @@ use windows_sys::Win32::System::Threading::CreateMutexW;
 
 use app::MicHostApp;
 
+pub const WINDOW_TITLE: &str = concat!("MicHost ", env!("MICHOST_DISPLAY_VERSION"));
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
@@ -271,7 +273,7 @@ fn run(
         centered: true,
         persist_window: false,
         viewport: egui::ViewportBuilder::default()
-            .with_title("MicHost")
+            .with_title(WINDOW_TITLE)
             .with_inner_size(size)
             .with_min_inner_size(size)
             .with_max_inner_size(size)

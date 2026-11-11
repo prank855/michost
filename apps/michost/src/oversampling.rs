@@ -38,6 +38,7 @@ impl Oversampler {
         }
     }
 
+    #[cfg(test)]
     pub fn upsample(&mut self, input: &[&[f32]], frames: usize, output: &mut [Vec<f32>]) {
         let channels = self.up_history.len().min(input.len()).min(output.len());
         for channel in 0..channels {
@@ -53,6 +54,7 @@ impl Oversampler {
         }
     }
 
+    #[cfg(test)]
     pub fn downsample(&mut self, input: &[Vec<f32>], frames: usize, output: &mut [&mut [f32]]) {
         let channels = self.down_history.len().min(input.len()).min(output.len());
         for channel in 0..channels {
@@ -67,6 +69,29 @@ impl Oversampler {
                 destination,
             );
         }
+    }
+
+    /// Single-channel upsample used by [`OversampledProcessor::process`], which
+    /// cannot build a temporary slice-of-slices without allocating.
+    fn upsample_one(&mut self, channel: usize, input: &[f32], output: &mut [f32]) {
+        let Self {
+            taps,
+            factor,
+            up_history,
+            ..
+        } = self;
+        upsample_channel(taps, *factor, &mut up_history[channel], input, output);
+    }
+
+    /// Single-channel downsample counterpart of [`Self::upsample_one`].
+    fn downsample_one(&mut self, channel: usize, input: &[f32], output: &mut [f32]) {
+        let Self {
+            taps,
+            factor,
+            down_history,
+            ..
+        } = self;
+        downsample_channel(taps, *factor, &mut down_history[channel], input, output);
     }
 }
 
@@ -181,7 +206,10 @@ impl OversampledProcessor {
 impl PluginProcessor for OversampledProcessor {
     fn process(&mut self, channels: &mut [&mut [f32]], frames: usize) {
         let frames = frames.min(self.max_frames);
-        let active = channels.len().min(self.channels);
+        let active = channels
+            .len()
+            .min(self.channels)
+            .min(michost_graph::MAX_PROCESS_CHANNELS);
         if frames == 0 || active == 0 || self.factor <= 1 {
             if self.factor <= 1 {
                 self.inner.process(channels, frames);
@@ -190,21 +218,35 @@ impl PluginProcessor for OversampledProcessor {
         }
         let graph_frames = frames * self.factor;
         {
-            let input: Vec<&[f32]> = channels[..active]
-                .iter()
-                .map(|channel| &channel[..frames])
-                .collect();
-            self.up.upsample(&input, frames, &mut self.scratch);
+            let Self { up, scratch, .. } = self;
+            for channel in 0..active {
+                let source = &channels[channel][..frames];
+                let destination = &mut scratch[channel][..graph_frames];
+                up.upsample_one(channel, source, destination);
+            }
         }
         {
-            let mut buffers: Vec<&mut [f32]> = self.scratch[..active]
+            let Self { inner, scratch, .. } = self;
+            // A fixed-size stack array keeps this allocation-free; the empty
+            // mutable slices are only placeholders for unused channels.
+            let mut buffers: [&mut [f32]; michost_graph::MAX_PROCESS_CHANNELS] =
+                std::array::from_fn(|_| &mut [][..]);
+            for (slot, buffer) in buffers[..active]
                 .iter_mut()
-                .map(|buffer| &mut buffer[..graph_frames])
-                .collect();
-            self.inner.process(&mut buffers, graph_frames);
+                .zip(scratch[..active].iter_mut())
+            {
+                *slot = &mut buffer[..graph_frames];
+            }
+            inner.process(&mut buffers[..active], graph_frames);
         }
-        self.down
-            .downsample(&self.scratch[..active], frames, &mut channels[..active]);
+        {
+            let Self { down, scratch, .. } = self;
+            for channel in 0..active {
+                let source = &scratch[channel][..graph_frames];
+                let destination = &mut channels[channel][..frames];
+                down.downsample_one(channel, source, destination);
+            }
+        }
     }
 }
 

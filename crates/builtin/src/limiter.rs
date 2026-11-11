@@ -228,16 +228,17 @@ impl Core {
         let link_target = (params.get(3) * 0.01).clamp(0.0, 1.0);
         let mix_target = (params.get(4) * 0.01).clamp(0.0, 1.0);
         let release = smoothing_coefficient(release_ms, self.sample_rate);
+        let input_gain_target = db_to_gain(input_db);
 
         if !self.primed {
-            self.input_gain.set_value(input_db);
+            self.input_gain.set_value(input_gain_target);
             self.link.set_value(link_target);
             self.mix.set_value(mix_target);
             self.primed = true;
         }
 
         for (l, r) in left.iter_mut().zip(right.iter_mut()) {
-            let input_gain = db_to_gain(self.input_gain.process(input_db));
+            let input_gain = self.input_gain.process(input_gain_target);
             let input_l = *l * input_gain;
             let input_r = *r * input_gain;
 

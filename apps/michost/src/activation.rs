@@ -1,9 +1,13 @@
-use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, SW_HIDE, SW_RESTORE, SetForegroundWindow, ShowWindow,
+    FindWindowW, PostMessageW, SW_HIDE, SW_RESTORE, SetForegroundWindow, ShowWindow, WM_PAINT,
 };
 
 const EVENT_NAME: &str = "Local\\MicHost.Show\0";
@@ -52,7 +56,10 @@ impl Activation {
 }
 
 fn main_window() -> windows_sys::Win32::Foundation::HWND {
-    let title: Vec<u16> = "MicHost\0".encode_utf16().collect();
+    let title: Vec<u16> = crate::WINDOW_TITLE
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     unsafe { FindWindowW(std::ptr::null(), title.as_ptr()) }
 }
 
@@ -87,4 +94,52 @@ pub fn signal_existing() -> Result<(), String> {
         CloseHandle(handle);
     }
     Ok(())
+}
+
+/// Keeps the egui event loop alive while the window is hidden.
+///
+/// winit only runs `App::update` on `WM_PAINT`, and Windows does not generate
+/// `WM_PAINT` for a hidden window, so eframe's 1 s `request_repaint_after`
+/// would never fire after `SW_HIDE`. A posted `WM_PAINT` is delivered even to a
+/// hidden window, so this thread wakes the loop once per second. Stop it with
+/// a channel send; the thread only reads the shared hidden flag.
+pub struct HiddenWake {
+    stop: mpsc::Sender<()>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl HiddenWake {
+    pub fn new(hidden: Arc<AtomicBool>) -> Result<Self, String> {
+        let (stop, receiver) = mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("michost-hidden-wake".to_string())
+            .spawn(move || {
+                while let Err(RecvTimeoutError::Timeout) =
+                    receiver.recv_timeout(Duration::from_secs(1))
+                {
+                    if hidden.load(Ordering::Acquire) {
+                        let window = main_window();
+                        if !window.is_null() {
+                            unsafe {
+                                PostMessageW(window, WM_PAINT, 0, 0);
+                            }
+                        }
+                    }
+                }
+            })
+            .map_err(|error| format!("starting the hidden repaint thread: {error}"))?;
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for HiddenWake {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }

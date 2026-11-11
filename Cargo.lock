@@ -1388,7 +1388,7 @@ dependencies = [
 
 [[package]]
 name = "michost"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "eframe",
  "egui",
@@ -1411,21 +1411,21 @@ dependencies = [
 
 [[package]]
 name = "michost-builtin"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "michost-graph",
 ]
 
 [[package]]
 name = "michost-graph"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "michost-host-abi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "michost-graph",
  "serde",
@@ -1433,7 +1433,7 @@ dependencies = [
 
 [[package]]
 name = "michost-host-juce"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libloading",
  "michost-graph",
@@ -1442,9 +1442,10 @@ dependencies = [
 
 [[package]]
 name = "michost-project"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64",
+ "michost-builtin",
  "michost-graph",
  "michost-host-abi",
  "serde",
@@ -1453,7 +1454,7 @@ dependencies = [
 
 [[package]]
 name = "michost-vmic"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "windows-sys 0.61.2",
 ]

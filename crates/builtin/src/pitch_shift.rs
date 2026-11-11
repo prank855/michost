@@ -8,7 +8,7 @@
 
 use std::f32::consts::PI;
 
-use crate::dsp_util::OnePole;
+use crate::dsp_util::{OnePole, circular_read};
 use crate::{BuiltinDsp, ParamCurve, ParamSet, ParamSpec, ParamStyle};
 
 pub static SPECS: &[ParamSpec] = &[
@@ -96,20 +96,13 @@ impl GranularBuffer {
     #[inline]
     fn read(&self, delay_samples: f32) -> f32 {
         let length = self.buffer.len();
-        let max_delay = (length - 3) as f64;
+        let max_delay = (length.saturating_sub(3)) as f32;
         let delay = if delay_samples.is_finite() {
-            f64::from(delay_samples).clamp(1.0, max_delay)
+            delay_samples.clamp(1.0, max_delay.max(1.0))
         } else {
             1.0
         };
-        let mut position = (self.write as f64 - delay).rem_euclid(length as f64);
-        if position >= length as f64 {
-            position = 0.0;
-        }
-        let index = (position.floor() as usize).min(length - 1);
-        let next = if index + 1 == length { 0 } else { index + 1 };
-        let fraction = (position - index as f64) as f32;
-        self.buffer[index] + (self.buffer[next] - self.buffer[index]) * fraction
+        circular_read(&self.buffer, self.write, delay)
     }
 
     fn clear(&mut self) {

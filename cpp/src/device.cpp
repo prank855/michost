@@ -448,7 +448,9 @@ int32_t DeviceStream::open()
     }
 
     const auto requestedRate = config.sample_rate > 0.0 ? config.sample_rate : 0.0;
-    const auto requestedBlock = config.block_size > 0 ? static_cast<int>(config.block_size) : 0;
+    auto requestedBlock = config.block_size > 0 ? static_cast<int>(config.block_size) : 0;
+    if (requestedBlock == 0 && config.api == MH_API_WASAPI_LOW_LATENCY)
+        requestedBlock = device->getDefaultBufferSize();
 
     auto error = device->open(inputMask, outputMask, requestedRate, requestedBlock);
 

@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+michost-builtin.workspace = true
 michost-graph.workspace = true
 michost-host-abi.workspace = true
 serde.workspace = true

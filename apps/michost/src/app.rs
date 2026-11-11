@@ -13,12 +13,12 @@ use michost_host_abi::{
     AudioApi, DeviceInfo, DeviceKind, MH_NOT_SUPPORTED, PluginDescriptor, StreamHost,
 };
 use michost_host_juce::JuceBackend;
-use michost_project::{DeviceSelection, MonoSource, OutputKind, PROJECT_EXTENSION, Project};
-use michost_vmic::VmicClient;
+use michost_project::{DeviceSelection, OutputKind, PROJECT_EXTENSION, Project, ProjectSettings};
 
-use crate::activation::Activation;
+use crate::activation::{Activation, HiddenWake};
 use crate::audio_session::{
     AudioSession, PreparedPlugin, discard_prepared, prepare_plugin_for_insert,
+    prepare_plugin_for_insert_with_oversampling,
 };
 use crate::autostart;
 use crate::builtin_ui::{self, BuiltinEditor};
@@ -33,6 +33,7 @@ use crate::tray::{Tray, TrayCommand};
 enum EngineState {
     Stopped,
     Starting,
+    Stopping,
     Running,
     Error,
 }
@@ -42,6 +43,7 @@ impl EngineState {
         match self {
             Self::Stopped => "Stopped",
             Self::Starting => "Starting",
+            Self::Stopping => "Stopping",
             Self::Running => "Running",
             Self::Error => "Error",
         }
@@ -51,10 +53,78 @@ impl EngineState {
         match self {
             Self::Stopped => egui::Color32::from_rgb(150, 155, 165),
             Self::Starting => egui::Color32::from_rgb(230, 180, 80),
+            Self::Stopping => egui::Color32::from_rgb(230, 180, 80),
             Self::Running => egui::Color32::from_rgb(110, 210, 140),
             Self::Error => egui::Color32::from_rgb(235, 105, 105),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct DeviceDraft {
+    input: DeviceSelection,
+    output: DeviceSelection,
+    sidechain_input: DeviceSelection,
+    sidechain_input_enabled: bool,
+    sample_rate: f64,
+    buffer_size: u32,
+    output_buffer_size: u32,
+    safety_buffer_ms: u32,
+}
+
+impl DeviceDraft {
+    fn from_settings(settings: &ProjectSettings) -> Self {
+        Self {
+            input: settings.input.clone(),
+            output: settings.output.clone(),
+            sidechain_input: settings.sidechain_input.clone(),
+            sidechain_input_enabled: settings.sidechain_input_enabled,
+            sample_rate: settings.sample_rate,
+            buffer_size: settings.buffer_size,
+            output_buffer_size: settings.output_buffer_size,
+            safety_buffer_ms: settings.safety_buffer_ms,
+        }
+    }
+
+    fn matches(&self, settings: &ProjectSettings) -> bool {
+        self.input == settings.input
+            && self.output == settings.output
+            && self.sidechain_input == settings.sidechain_input
+            && self.sidechain_input_enabled == settings.sidechain_input_enabled
+            && self.sample_rate == settings.sample_rate
+            && self.buffer_size == settings.buffer_size
+            && self.output_buffer_size == settings.output_buffer_size
+            && self.safety_buffer_ms == settings.safety_buffer_ms
+    }
+
+    fn apply_to(&self, settings: &mut ProjectSettings) {
+        settings.input = self.input.clone();
+        settings.output = self.output.clone();
+        settings.sidechain_input = self.sidechain_input.clone();
+        settings.sidechain_input_enabled = self.sidechain_input_enabled;
+        settings.sample_rate = self.sample_rate;
+        settings.buffer_size = self.buffer_size;
+        settings.output_buffer_size = self.output_buffer_size;
+        settings.safety_buffer_ms = self.safety_buffer_ms;
+    }
+}
+
+struct StopOutcome {
+    project: Project,
+    warnings: Vec<String>,
+    measurement: Option<Result<latency::Measurement, String>>,
+}
+
+#[derive(Clone)]
+struct MeasureRequest {
+    output: DeviceInfo,
+    input: DeviceInfo,
+    output_channels: u32,
+    output_mask: u64,
+    input_channels: u32,
+    input_mask: u64,
+    output_block: u32,
+    input_block: u32,
 }
 
 #[derive(Default)]
@@ -93,6 +163,7 @@ struct AddState {
 type SessionStartResult = Result<(AudioSession, Project), String>;
 
 const START_RETRY_DELAY: Duration = Duration::from_secs(3);
+const QUIT_STOP_WAIT: Duration = Duration::from_secs(5);
 const ADD_PLUGIN_BUTTON_HEIGHT: f32 = 28.0;
 const POINTER_REPAINT_INTERVAL: Duration = Duration::from_millis(40);
 
@@ -101,6 +172,8 @@ struct PendingAdd {
     spec: PluginSpec,
     session_epoch: u64,
     receiver: Receiver<Result<PreparedPlugin, String>>,
+    insert_after: Option<u64>,
+    template: Option<ChainEntry>,
 }
 
 enum ChainAction {
@@ -110,6 +183,7 @@ enum ChainAction {
     Oversampling(usize, u8),
     Sidechain(usize, SidechainSource),
     OpenEditor(usize),
+    Duplicate(usize),
     Add(PluginDescriptor),
 }
 
@@ -120,13 +194,17 @@ pub struct MicHostApp {
     project_path: Option<PathBuf>,
     session: Option<AudioSession>,
     session_worker: Option<Receiver<SessionStartResult>>,
+    stop_worker: Option<Receiver<StopOutcome>>,
+    stop_restart: bool,
+    rescan_after_stop: bool,
+    device_draft: DeviceDraft,
     cancel_start: bool,
     cancel_flag: Arc<AtomicBool>,
     state: EngineState,
     last_error: Option<String>,
     warnings: Vec<String>,
+    startup_warnings: Vec<String>,
     devices: DeviceCache,
-    vmic_installed: bool,
     device_worker: Option<Receiver<Result<DeviceCache, String>>>,
     device_error: Option<String>,
     device_change_pending: bool,
@@ -139,6 +217,8 @@ pub struct MicHostApp {
     scan: ScanState,
     tray: Option<Tray>,
     activation: Option<Activation>,
+    #[expect(dead_code, reason = "held to stop the hidden repaint thread on drop")]
+    hidden_wake: Option<HiddenWake>,
     add: AddState,
     dirty: bool,
     save_deadline: Option<Instant>,
@@ -153,6 +233,8 @@ pub struct MicHostApp {
     created_at: Instant,
     first_frame_logged: bool,
     hidden: bool,
+    hidden_frames: u8,
+    hidden_flag: Arc<AtomicBool>,
     monitor: bool,
     show_monitor_settings: bool,
     auto_measure: bool,
@@ -162,6 +244,8 @@ pub struct MicHostApp {
     plugin_edit_at: Instant,
     measure_worker: Option<mpsc::Receiver<Result<latency::Capture, String>>>,
     measured: Option<latency::Measurement>,
+    asio_round_trip: Option<latency::Measurement>,
+    latency_error: Option<String>,
     builtin_editors: Vec<BuiltinEditor>,
     quitting: bool,
     tray_running: bool,
@@ -202,7 +286,7 @@ impl MicHostApp {
         style.spacing.scroll.floating_width = 8.0;
         cc.egui_ctx.set_style(style);
 
-        let (project, project_path) = load_startup_project();
+        let (project, project_path, startup_warnings) = load_startup_project();
         let (backend, backend_error) = match JuceBackend::load() {
             Ok(backend) => (Some(Arc::new(backend)), None),
             Err(error) => {
@@ -238,9 +322,18 @@ impl MicHostApp {
                 None
             }
         };
+        let hidden_flag = Arc::new(AtomicBool::new(!show_on_start));
+        let hidden_wake = match HiddenWake::new(hidden_flag.clone()) {
+            Ok(wake) => Some(wake),
+            Err(error) => {
+                logging::line(format!("hidden repaint thread: {error}"));
+                None
+            }
+        };
 
         let next_plugin_id = project.next_plugin_id();
         let monitor_enabled = project.settings.monitor_enabled;
+        let device_draft = DeviceDraft::from_settings(&project.settings);
         let mut app = Self {
             backend,
             backend_error,
@@ -248,13 +341,17 @@ impl MicHostApp {
             project_path,
             session: None,
             session_worker: None,
+            stop_worker: None,
+            stop_restart: false,
+            rescan_after_stop: false,
+            device_draft,
             cancel_start: false,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             state: EngineState::Stopped,
             last_error: None,
             warnings: Vec::new(),
+            startup_warnings: Vec::new(),
             devices,
-            vmic_installed: cfg!(debug_assertions) && VmicClient::is_installed(),
             device_worker: None,
             device_error: None,
             device_change_pending: false,
@@ -267,6 +364,7 @@ impl MicHostApp {
             scan: ScanState::default(),
             tray,
             activation,
+            hidden_wake,
             add: AddState::default(),
             dirty: false,
             save_deadline: None,
@@ -281,6 +379,8 @@ impl MicHostApp {
             created_at,
             first_frame_logged: false,
             hidden: !show_on_start,
+            hidden_frames: 0,
+            hidden_flag,
             monitor: monitor_enabled,
             show_monitor_settings: show_monitor,
             auto_measure,
@@ -290,6 +390,8 @@ impl MicHostApp {
             plugin_edit_at: Instant::now(),
             measure_worker: None,
             measured: None,
+            asio_round_trip: None,
+            latency_error: None,
             builtin_editors: Vec::new(),
             quitting: false,
             tray_running: false,
@@ -312,13 +414,24 @@ impl MicHostApp {
         if app.apply_automatic_apis() {
             app.mark_dirty();
         }
+        app.device_draft = DeviceDraft::from_settings(&app.project.settings);
         if !show_on_start && app.can_start() {
             app.start_audio();
         }
         if app.tray.is_none() && app.hidden {
             app.hidden = false;
+            app.hidden_flag.store(false, Ordering::Release);
             cc.egui_ctx
                 .send_viewport_cmd(ViewportCommand::Visible(true));
+        }
+        if !startup_warnings.is_empty() {
+            // Stripping built-ins happened on load, not from a user edit. Show
+            // the warning but never rewrite the user's project on startup. The
+            // list is re-applied when a session start replaces `warnings`.
+            app.warnings.extend(startup_warnings.iter().cloned());
+            app.startup_warnings = startup_warnings;
+            app.dirty = false;
+            app.save_deadline = None;
         }
         logging::line(format!(
             "app constructed in {:.1} ms",
@@ -329,11 +442,18 @@ impl MicHostApp {
 
     fn refresh_devices(&mut self) {
         self.measured = None;
-        if self.device_worker.is_some() || self.session_worker.is_some() {
+        self.asio_round_trip = None;
+        self.latency_error = None;
+        if self.device_worker.is_some()
+            || self.session_worker.is_some()
+            || self.stop_worker.is_some()
+        {
             return;
         }
         if self.session.is_some() {
-            self.stop_audio();
+            self.rescan_after_stop = true;
+            self.stop_audio_async(false);
+            return;
         }
         let Some(backend) = self.backend.clone() else {
             return;
@@ -348,14 +468,17 @@ impl MicHostApp {
         };
         match receiver.try_recv() {
             Ok(Ok(cache)) => {
+                let pending_before = !self.device_draft.matches(&self.project.settings);
                 self.devices = cache;
-                self.vmic_installed = cfg!(debug_assertions) && VmicClient::is_installed();
                 self.device_error = None;
                 self.device_change_quiet_until = Instant::now() + Duration::from_secs(2);
                 if self.apply_automatic_apis() {
                     self.mark_dirty();
                 }
                 self.apply_device_defaults();
+                if !pending_before {
+                    self.device_draft = DeviceDraft::from_settings(&self.project.settings);
+                }
             }
             Ok(Err(error)) => {
                 self.device_error = Some(error);
@@ -398,40 +521,11 @@ impl MicHostApp {
         if self.project.settings.advanced_mode {
             return false;
         }
-        let devices = &self.devices;
-        let settings = &mut self.project.settings;
-        let mut changed = false;
-        let input_api = automatic_api(
-            &devices.inputs,
-            &settings.input.name,
-            settings.input.api,
-            true,
-        );
-        changed |= set_selection_api(&devices.inputs, &mut settings.input, input_api, true);
-        let output_api = automatic_api(
-            &devices.outputs,
-            &settings.output.name,
-            settings.output.api,
-            false,
-        );
-        changed |= set_selection_api(&devices.outputs, &mut settings.output, output_api, false);
-        let sidechain_api = automatic_api(
-            &devices.inputs,
-            &settings.sidechain_input.name,
-            settings.sidechain_input.api,
-            true,
-        );
-        changed |= set_selection_api(
-            &devices.inputs,
-            &mut settings.sidechain_input,
-            sidechain_api,
-            true,
-        );
-        changed
+        apply_automatic_apis_to(&self.devices, &mut self.project.settings)
     }
 
     fn start_audio(&mut self) {
-        if self.session.is_some() || self.session_worker.is_some() {
+        if self.session.is_some() || self.session_worker.is_some() || self.stop_worker.is_some() {
             return;
         }
         if self.device_worker.is_some() {
@@ -457,10 +551,7 @@ impl MicHostApp {
             None
         };
         let mono_source = if self.project.settings.input.channels == 1 {
-            Some(match self.project.settings.input_mono_source {
-                MonoSource::Left => 0,
-                MonoSource::Right => 1,
-            })
+            Some(0)
         } else {
             None
         };
@@ -536,16 +627,24 @@ impl MicHostApp {
                 let cancelled = self.cancel_start;
                 self.cancel_start = false;
                 if cancelled {
-                    drop(session);
+                    let _ = std::thread::Builder::new()
+                        .name("michost-discard-session".to_string())
+                        .spawn(move || drop(session));
                     self.state = EngineState::Stopped;
                     self.auto_retry_at = None;
                     self.tooltip = "MicHost - stopped".to_string();
                     self.set_tray_running(false);
                     self.save_now();
+                    let restart = self.stop_restart && !self.engine_paused;
+                    self.stop_restart = false;
+                    if restart {
+                        self.start_audio();
+                    }
                     return;
                 }
                 self.session_epoch = self.session_epoch.wrapping_add(1);
-                self.warnings = session.warnings.clone();
+                self.warnings = self.startup_warnings.clone();
+                self.warnings.extend(session.warnings.iter().cloned());
                 logging::line(format!(
                     "audio running: {} Hz in, {} Hz out, block {}, latency {:.1} ms",
                     session.input().sample_rate as u32,
@@ -579,8 +678,7 @@ impl MicHostApp {
                                 self.project.settings.monitor_enabled = false;
                                 logging::line(format!("monitor: {error}"));
                                 self.last_error = Some(format!("monitor: {error}"));
-                                self.mark_dirty();
-                                self.save_now();
+                                self.save_after_session_start();
                             } else {
                                 logging::line(format!("monitor: enabled on '{}'", selection.name));
                             }
@@ -592,8 +690,7 @@ impl MicHostApp {
                                 "no monitor output is available; choose a device in Monitor settings"
                                     .to_string(),
                             );
-                            self.mark_dirty();
-                            self.save_now();
+                            self.save_after_session_start();
                         }
                     }
                 }
@@ -602,8 +699,7 @@ impl MicHostApp {
                 self.auto_retry_at = None;
                 self.tooltip = "MicHost - running".to_string();
                 self.set_tray_running(true);
-                self.mark_dirty();
-                self.save_now();
+                self.save_after_session_start();
             }
             Ok(Err(error)) => {
                 self.session_worker = None;
@@ -663,11 +759,184 @@ impl MicHostApp {
         self.save_now();
     }
 
+    fn stop_audio_async(&mut self, restart: bool) {
+        self.stop_audio_async_with_measure(restart, None);
+    }
+
+    fn stop_audio_async_with_measure(&mut self, restart: bool, measure: Option<MeasureRequest>) {
+        // The latest normal stop/restart request is authoritative, so a tray
+        // Stop can cancel a restart queued behind an in-flight stop. A
+        // measurement stop keeps its own restart intent (ASIO duplex resume)
+        // but never overrides a newer normal request.
+        if measure.is_none() {
+            self.stop_restart = restart;
+        } else if restart {
+            self.stop_restart = true;
+        }
+        if self.stop_worker.is_some() {
+            if measure.is_some() {
+                self.last_error = Some("wait for the current audio change to finish".to_string());
+                self.measuring = false;
+            }
+            return;
+        }
+        if self.session_worker.is_some() {
+            if measure.is_some() {
+                self.last_error = Some("wait for audio to finish starting".to_string());
+                self.measuring = false;
+                return;
+            }
+            self.cancel_flag.store(true, Ordering::Release);
+            self.cancel_start = true;
+            self.state = EngineState::Stopping;
+            self.tooltip = "MicHost - stopping".to_string();
+            self.set_tray_running(false);
+            self.mark_dirty();
+            return;
+        }
+        let Some(mut session) = self.session.take() else {
+            if measure.is_some() {
+                self.last_error = Some("start audio to measure the chain".to_string());
+                self.measuring = false;
+            }
+            let restart = self.stop_restart && !self.engine_paused;
+            self.stop_restart = false;
+            if restart {
+                self.start_audio();
+            }
+            return;
+        };
+        self.builtin_editors.clear();
+        let mut project = self.project.clone();
+        let backend = self.backend.clone();
+        let (sender, receiver) = mpsc::channel();
+        self.stop_worker = Some(receiver);
+        self.state = EngineState::Stopping;
+        self.tooltip = "MicHost - stopping".to_string();
+        self.set_tray_running(false);
+        logging::line("audio stopping");
+        let spawned = std::thread::Builder::new()
+            .name("michost-stop".to_string())
+            .spawn(move || {
+                session.stop(Some(&mut project));
+                let warnings = session.warnings.clone();
+                drop(session);
+                let measurement = measure.map(|request| {
+                    let Some(backend) = backend else {
+                        return Err("mic_host.dll is not loaded".to_string());
+                    };
+                    let block = if request.input_block > 0 {
+                        request.input_block
+                    } else {
+                        request.output_block
+                    };
+                    latency::measure_duplex(
+                        backend.as_ref(),
+                        &request.output,
+                        &request.input,
+                        2,
+                        request.output.api,
+                        request.output_channels,
+                        request.output_mask,
+                        request.input_channels,
+                        request.input_mask,
+                        block,
+                    )
+                });
+                let _ = sender.send(StopOutcome {
+                    project,
+                    warnings,
+                    measurement,
+                });
+            });
+        if let Err(error) = spawned {
+            self.stop_worker = None;
+            self.stop_restart = false;
+            self.measuring = false;
+            self.state = EngineState::Error;
+            self.last_error = Some(format!("starting the stop worker: {error}"));
+            self.tooltip = "MicHost - error".to_string();
+        }
+    }
+
+    /// Merges the plugin state, warnings and measurement produced by a stop
+    /// worker into the live project. Used by the normal poll path and by quit,
+    /// which must not save while an in-flight stop still owns the session.
+    fn merge_stop_outcome(&mut self, outcome: StopOutcome) {
+        for (id, state) in outcome.project.plugin_states {
+            if self.project.chain.iter().any(|entry| entry.id == id) {
+                self.project.plugin_states.insert(id, state);
+            }
+        }
+        self.project.prune_plugin_states();
+        self.warnings.extend(outcome.warnings);
+        if let Some(measurement) = outcome.measurement {
+            match measurement {
+                Ok(measurement) => {
+                    self.asio_round_trip = Some(measurement);
+                    self.latency_error = None;
+                }
+                Err(error) => {
+                    self.latency_error = Some(error.clone());
+                    self.last_error = Some(format!("latency measurement: {error}"));
+                }
+            }
+            self.measuring = false;
+        }
+    }
+
+    fn poll_stop_worker(&mut self) {
+        let Some(receiver) = self.stop_worker.take() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(outcome) => {
+                self.stop_worker = None;
+                self.merge_stop_outcome(outcome);
+                self.session_epoch = self.session_epoch.wrapping_add(1);
+                self.state = EngineState::Stopped;
+                self.auto_retry_at = None;
+                self.tooltip = "MicHost - stopped".to_string();
+                self.set_tray_running(false);
+                self.save_after_session_start();
+                let rescan = self.rescan_after_stop;
+                self.rescan_after_stop = false;
+                let restart = self.stop_restart && !self.engine_paused;
+                self.stop_restart = false;
+                if rescan {
+                    self.refresh_devices();
+                } else if restart {
+                    self.start_audio();
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                self.stop_worker = Some(receiver);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.stop_worker = None;
+                let restart = self.stop_restart && !self.engine_paused;
+                self.stop_restart = false;
+                self.measuring = false;
+                self.state = EngineState::Error;
+                self.last_error = Some("the stop worker stopped unexpectedly".to_string());
+                self.tooltip = "MicHost - error".to_string();
+                self.set_tray_running(false);
+                if restart {
+                    self.start_audio();
+                }
+            }
+        }
+    }
+
     fn ensure_engine(&mut self, now: Instant) {
         if self.quitting || self.engine_paused || self.measuring {
             return;
         }
-        if self.session.is_some() || self.session_worker.is_some() || self.device_worker.is_some() {
+        if self.session.is_some()
+            || self.session_worker.is_some()
+            || self.stop_worker.is_some()
+            || self.device_worker.is_some()
+        {
             return;
         }
         if !self.can_start() {
@@ -717,7 +986,7 @@ impl MicHostApp {
                     self.show_window(ctx);
                     self.engine_paused = true;
                     self.auto_retry_at = None;
-                    self.stop_audio();
+                    self.stop_audio_async(false);
                 }
                 TrayCommand::Quit => {
                     logging::line("quit requested from the tray");
@@ -738,23 +1007,51 @@ impl MicHostApp {
                     && self.session.is_some()
                     && self.session_epoch == pending.session_epoch;
                 if running {
+                    let position = if let Some(source_id) = pending.insert_after {
+                        match self
+                            .project
+                            .chain
+                            .iter()
+                            .position(|entry| entry.id == source_id)
+                        {
+                            Some(index) => index + 1,
+                            None => {
+                                if let Some(backend) = self.backend.clone() {
+                                    discard_prepared(&backend, prepared);
+                                }
+                                self.last_error =
+                                    Some("the plugin to duplicate was removed".to_string());
+                                return;
+                            }
+                        }
+                    } else {
+                        self.project.chain.len()
+                    };
+                    let source_state = pending
+                        .insert_after
+                        .and_then(|source_id| self.project.plugin_states.get(&source_id).cloned());
                     let id = self.allocate_plugin_id();
-                    let mut spec = pending.spec;
-                    spec.main_inputs = prepared.main_inputs;
-                    spec.main_outputs = prepared.main_outputs;
-                    spec.sidechain_inputs = prepared.native_sidechain;
-                    self.project.chain.push(ChainEntry {
+                    let mut entry = pending.template.unwrap_or(ChainEntry {
                         id,
-                        plugin: spec,
+                        plugin: pending.spec,
                         bypassed: false,
                         sidechain_source: SidechainSource::Off,
                         oversampling: 1,
                     });
+                    entry.id = id;
+                    entry.plugin.main_inputs = prepared.main_inputs;
+                    entry.plugin.main_outputs = prepared.main_outputs;
+                    entry.plugin.sidechain_inputs = prepared.native_sidechain;
+                    self.project.chain.insert(position, entry);
+                    if let Some(state) = source_state {
+                        self.project.plugin_states.insert(id, state);
+                    }
                     let inserted = self.session.as_mut().map(|session| {
                         session.insert_prepared_with_project(&self.project, id, prepared)
                     });
                     if let Some(Err(error)) = inserted {
                         self.project.chain.retain(|entry| entry.id != id);
+                        self.project.plugin_states.remove(&id);
                         self.last_error = Some(error);
                         return;
                     }
@@ -779,6 +1076,125 @@ impl MicHostApp {
                 ));
             }
         }
+    }
+
+    fn begin_duplicate(&mut self, index: usize) {
+        if self.pending_add.is_some() {
+            return;
+        }
+        let Some(source) = self.project.chain.get(index).cloned() else {
+            return;
+        };
+        let source_state = self.project.plugin_states.get(&source.id).cloned();
+
+        if let Some(kind) = BuiltinKind::from_path(&source.plugin.path) {
+            if !cfg!(debug_assertions) {
+                self.last_error =
+                    Some("built-in effects are not included in release builds".to_string());
+                return;
+            }
+            if self.session_worker.is_some() {
+                self.stop_audio();
+            }
+            let id = self.allocate_plugin_id();
+            let mut entry = source.clone();
+            entry.id = id;
+            self.project.chain.insert(index + 1, entry);
+            if let Some(state) = source_state.clone() {
+                self.project.plugin_states.insert(id, state);
+            }
+            if self.state == EngineState::Running
+                && let Some(session) = self.session.as_mut()
+            {
+                let params = ParamSet::new(kind);
+                if let Some(state) = &source_state {
+                    let _ = params.decode(&state.component);
+                }
+                if let Err(error) = session.insert_builtin_with_project(
+                    &self.project,
+                    id,
+                    kind,
+                    params,
+                    kind.name(),
+                ) {
+                    self.project.chain.retain(|entry| entry.id != id);
+                    self.project.plugin_states.remove(&id);
+                    self.last_error = Some(error);
+                    return;
+                }
+            }
+            self.mark_dirty();
+            self.save_now();
+            return;
+        }
+
+        if self.state == EngineState::Running && self.session.is_some() {
+            let Some(backend) = self.backend.clone() else {
+                self.last_error = Some("mic_host.dll is not loaded".to_string());
+                return;
+            };
+            let Some(session) = self.session.as_ref() else {
+                return;
+            };
+            let sample_rate = session.sample_rate();
+            let block_size = session.block_size();
+            let oversampling = michost_graph::normalize_oversampling(source.oversampling);
+            let path = source.plugin.path.clone();
+            let class_id = source.plugin.class_id.clone();
+            let name = source.plugin.name.clone();
+            let sidechain = if source.sidechain_source != SidechainSource::Off {
+                source.plugin.sidechain_inputs
+            } else {
+                0
+            };
+            let state = source_state.map(|state| state.component);
+            let (sender, receiver) = mpsc::channel();
+            let spawned = std::thread::Builder::new()
+                .name("michost-duplicate".to_string())
+                .spawn(move || {
+                    let result = prepare_plugin_for_insert_with_oversampling(
+                        backend,
+                        &path,
+                        &class_id,
+                        &name,
+                        sample_rate,
+                        block_size,
+                        oversampling,
+                        sidechain,
+                        state.as_deref(),
+                    );
+                    let _ = sender.send(result);
+                });
+            match spawned {
+                Ok(_) => {
+                    self.pending_add = Some(PendingAdd {
+                        name: source.plugin.name.clone(),
+                        spec: source.plugin.clone(),
+                        session_epoch: self.session_epoch,
+                        receiver,
+                        insert_after: Some(source.id),
+                        template: Some(source),
+                    });
+                }
+                Err(error) => {
+                    self.last_error = Some(format!("starting the plugin worker: {error}"));
+                }
+            }
+            return;
+        }
+
+        if self.session_worker.is_some() {
+            self.stop_audio();
+        }
+        let id = self.allocate_plugin_id();
+        let mut entry = source.clone();
+        entry.id = id;
+        self.project.chain.insert(index + 1, entry);
+        if let Some(state) = source_state {
+            self.project.plugin_states.insert(id, state);
+        }
+        self.mark_dirty();
+        self.save_now();
     }
 
     fn begin_add(&mut self, descriptor: &PluginDescriptor) {
@@ -826,6 +1242,8 @@ impl MicHostApp {
                         spec,
                         session_epoch: self.session_epoch,
                         receiver,
+                        insert_after: None,
+                        template: None,
                     });
                 }
                 Err(error) => {
@@ -1110,9 +1528,9 @@ impl MicHostApp {
                     logging::line(format!("device error {status}: {message}"));
                     self.last_error = Some(message);
                     if status != MH_NOT_SUPPORTED && self.state == EngineState::Running {
-                        self.stop_audio();
-                        self.state = EngineState::Error;
-                        self.auto_retry_at = Some(Instant::now() + START_RETRY_DELAY);
+                        logging::line("device error; restarting audio");
+                        self.auto_retry_at = None;
+                        self.stop_audio_async(true);
                     }
                 }
                 michost_host_abi::UiEvent::LatencyChanged { .. } => {}
@@ -1125,23 +1543,82 @@ impl MicHostApp {
             return;
         }
         self.latency_timer = Instant::now();
-        let Some(session) = self.session.as_mut() else {
-            return;
-        };
-        match session.refresh_latencies() {
-            Ok(true) => {
-                if let Err(error) = session.rebuild_engine(&self.project) {
-                    logging::line(format!("rebuilding for latency: {error}"));
+        let mut endpoint_refresh = None;
+        let mut last_input = None;
+        let mut last_output = None;
+        if let Some(session) = self.session.as_mut() {
+            match session.refresh_endpoints() {
+                Ok(refresh) => {
+                    if refresh.changed {
+                        last_input = Some((
+                            session.input().device.clone(),
+                            session.input().api,
+                            session.input().buffer_size,
+                        ));
+                        last_output = Some((
+                            session.output().device.clone(),
+                            session.output().api,
+                            session.output().buffer_size,
+                        ));
+                    }
+                    endpoint_refresh = Some(refresh);
+                }
+                Err(error) => {
+                    logging::line(format!("refreshing device endpoints: {error}"));
                 }
             }
-            Ok(false) => {}
-            Err(error) => self.last_error = Some(error),
+            let rate_changed = endpoint_refresh.is_some_and(|refresh| refresh.rate_changed);
+            if !rate_changed {
+                match session.refresh_latencies() {
+                    Ok(true) => {
+                        if let Err(error) = session.rebuild_engine(&self.project) {
+                            logging::line(format!("rebuilding for latency: {error}"));
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(error) => self.last_error = Some(error),
+                }
+            }
+            session.collect_retired();
         }
-        session.collect_retired();
+        if let Some(value) = last_input {
+            self.last_input_buffer = Some(value);
+        }
+        if let Some(value) = last_output {
+            self.last_output_buffer = Some(value);
+        }
+        if let Some(refresh) = endpoint_refresh {
+            if refresh.rate_changed {
+                logging::line(
+                    "the active device changed sample rate; restarting audio at the device rate",
+                );
+                self.project.settings.sample_rate = 0.0;
+                self.device_draft.sample_rate = 0.0;
+                self.mark_dirty();
+            }
+            let auto_buffer = self.project.settings.buffer_size == 0
+                || self.project.settings.output_buffer_size == 0;
+            if refresh.rate_changed || (refresh.buffer_changed && auto_buffer) {
+                self.stop_audio_async(true);
+            }
+        }
     }
 
     fn quit_now(&mut self) {
         arm_quit_watchdog();
+        if let Some(receiver) = self.stop_worker.take() {
+            // The stop worker owns the session and the last exported plugin
+            // state. Wait for its outcome (bounded by the quit watchdog) so the
+            // project saved on exit is not stale.
+            match receiver.recv_timeout(QUIT_STOP_WAIT) {
+                Ok(outcome) => self.merge_stop_outcome(outcome),
+                Err(error) => logging::line(format!(
+                    "quit: the audio change did not finish in time ({error}); saving the last known state"
+                )),
+            }
+            self.stop_restart = false;
+            self.measuring = false;
+        }
         if let Some(session) = self.session.as_mut() {
             session.quiesce(&mut self.project);
         }
@@ -1154,6 +1631,19 @@ impl MicHostApp {
     fn mark_dirty(&mut self) {
         self.dirty = true;
         self.save_deadline = Some(Instant::now() + Duration::from_millis(400));
+    }
+
+    /// Persists device metadata after a successful start, unless the loaded
+    /// project had built-in entries stripped. In that case the warning is
+    /// shown and the user's file is left untouched until a real edit or quit.
+    fn save_after_session_start(&mut self) {
+        if self.startup_warnings.is_empty() {
+            self.mark_dirty();
+            self.save_now();
+        } else {
+            self.dirty = false;
+            self.save_deadline = None;
+        }
     }
 
     fn save_now(&mut self) {
@@ -1187,6 +1677,10 @@ impl MicHostApp {
     }
 
     fn new_project(&mut self) {
+        if self.stop_worker.is_some() {
+            self.last_error = Some("wait for the current audio change to finish".to_string());
+            return;
+        }
         let Some(path) = project_dialog()
             .add_filter("MicHost project", &[PROJECT_EXTENSION])
             .set_file_name("MicHost.mhchain")
@@ -1217,11 +1711,16 @@ impl MicHostApp {
 
         self.next_plugin_id = project.next_plugin_id();
         self.project = project;
+        self.device_draft = DeviceDraft::from_settings(&self.project.settings);
         self.project_path = Some(path.clone());
         project_state::remember(&path);
+        self.monitor = self.project.settings.monitor_enabled;
+        self.startup_warnings.clear();
         self.warnings.clear();
         self.last_error = None;
         self.measured = None;
+        self.asio_round_trip = None;
+        self.latency_error = None;
         self.measuring = false;
         self.measure_worker = None;
         self.pending_add = None;
@@ -1236,6 +1735,10 @@ impl MicHostApp {
     }
 
     fn open_project(&mut self) {
+        if self.stop_worker.is_some() {
+            self.last_error = Some("wait for the current audio change to finish".to_string());
+            return;
+        }
         let Some(path) = project_dialog()
             .add_filter("MicHost project", &[PROJECT_EXTENSION])
             .add_filter("JSON", &["json"])
@@ -1252,17 +1755,35 @@ impl MicHostApp {
                 project_state::remember(&path);
                 self.next_plugin_id = project.next_plugin_id();
                 self.project = project;
+                self.device_draft = DeviceDraft::from_settings(&self.project.settings);
                 self.project_path = Some(path);
+                self.monitor = self.project.settings.monitor_enabled;
+                self.measured = None;
+                self.asio_round_trip = None;
+                self.latency_error = None;
+                self.measuring = false;
+                self.measure_worker = None;
+                self.startup_warnings = removed
+                    .iter()
+                    .map(|name| {
+                        format!(
+                            "built-in effect '{name}' is not included in release builds and was removed"
+                        )
+                    })
+                    .collect();
                 self.warnings.clear();
-                self.warnings.extend(removed.into_iter().map(|name| {
-                    format!(
-                        "built-in effect '{name}' is not included in release builds and was removed"
-                    )
-                }));
+                self.warnings.extend(self.startup_warnings.iter().cloned());
                 self.last_error = None;
                 self.state = EngineState::Stopped;
-                self.mark_dirty();
-                self.save_now();
+                if removed.is_empty() {
+                    self.mark_dirty();
+                    self.save_now();
+                } else {
+                    // Show the warning instead of rewriting the stripped
+                    // project behind the user's back; the next edit saves it.
+                    self.dirty = false;
+                    self.save_deadline = None;
+                }
             }
             Err(error) => {
                 logging::line(format!("opening project: {error}"));
@@ -1297,26 +1818,25 @@ impl MicHostApp {
         let device = selected_device(
             &self.devices.inputs,
             name,
-            self.project.settings.input.api,
+            self.device_draft.input.api,
             self.project.settings.advanced_mode,
             true,
         )
         .cloned();
         if let Some(device) = device {
-            let channels = self
-                .project
-                .settings
-                .input
-                .channels
-                .clamp(1, device.inputs.max(1));
-            self.project.settings.input = DeviceSelection {
+            let current = self.device_draft.input.channels;
+            let channels = if current == 0 {
+                device.inputs.clamp(1, 2)
+            } else {
+                current.clamp(1, device.inputs.max(1))
+            };
+            self.device_draft.input = DeviceSelection {
                 api: device.api,
                 name: device.name,
                 id: device.id,
                 channels,
                 channel_mask: 0,
             };
-            self.settings_changed();
         }
     }
 
@@ -1324,26 +1844,25 @@ impl MicHostApp {
         let device = selected_device(
             &self.devices.outputs,
             name,
-            self.project.settings.output.api,
+            self.device_draft.output.api,
             self.project.settings.advanced_mode,
             false,
         )
         .cloned();
         if let Some(device) = device {
-            let channels = self
-                .project
-                .settings
-                .output
-                .channels
-                .clamp(1, device.outputs.max(1));
-            self.project.settings.output = DeviceSelection {
+            let current = self.device_draft.output.channels;
+            let channels = if current == 0 {
+                device.outputs.clamp(1, 2)
+            } else {
+                current.clamp(1, 2)
+            };
+            self.device_draft.output = DeviceSelection {
                 api: device.api,
                 name: device.name,
                 id: device.id,
                 channels,
                 channel_mask: 0,
             };
-            self.settings_changed();
         }
     }
 
@@ -1351,36 +1870,59 @@ impl MicHostApp {
         let device = selected_device(
             &self.devices.inputs,
             name,
-            self.project.settings.sidechain_input.api,
+            self.device_draft.sidechain_input.api,
             self.project.settings.advanced_mode,
             true,
         )
         .cloned();
         if let Some(device) = device {
-            let channels = self
-                .project
-                .settings
-                .sidechain_input
-                .channels
-                .clamp(1, device.inputs.max(1));
-            self.project.settings.sidechain_input = DeviceSelection {
+            let current = self.device_draft.sidechain_input.channels;
+            let channels = if current == 0 {
+                device.inputs.clamp(1, 2)
+            } else {
+                current.clamp(1, device.inputs.max(1))
+            };
+            self.device_draft.sidechain_input = DeviceSelection {
                 api: device.api,
                 name: device.name,
                 id: device.id,
                 channels,
                 channel_mask: 0,
             };
-            self.settings_changed();
+        }
+    }
+
+    fn commit_device_draft(&mut self) {
+        if self.device_draft.matches(&self.project.settings) {
+            return;
+        }
+        if self.measuring {
+            self.last_error = Some("wait for the latency measurement to finish".to_string());
+            return;
+        }
+        self.device_draft.apply_to(&mut self.project.settings);
+        self.measured = None;
+        self.asio_round_trip = None;
+        self.latency_error = None;
+        self.mark_dirty();
+        if self.session.is_some() || self.session_worker.is_some() || self.stop_worker.is_some() {
+            self.stop_audio_async(true);
+        } else {
+            self.auto_retry_at = None;
+            self.state = EngineState::Stopped;
         }
     }
 
     fn settings_changed(&mut self) {
         self.measured = None;
-        if !self.project.settings.advanced_mode {
-            self.apply_automatic_apis();
+        self.asio_round_trip = None;
+        self.latency_error = None;
+        let pending_before = !self.device_draft.matches(&self.project.settings);
+        if !self.project.settings.advanced_mode && !pending_before && self.apply_automatic_apis() {
+            self.device_draft = DeviceDraft::from_settings(&self.project.settings);
         }
-        if self.session.is_some() || self.session_worker.is_some() {
-            self.stop_audio();
+        if self.session.is_some() || self.session_worker.is_some() || self.stop_worker.is_some() {
+            self.stop_audio_async(true);
         }
         self.mark_dirty();
     }
@@ -1432,8 +1974,7 @@ impl MicHostApp {
                 if let Some(entry) = self.project.chain.get_mut(index) {
                     entry.sidechain_source = source;
                 }
-                self.mark_dirty();
-                self.stop_audio();
+                self.settings_changed();
                 self.save_now();
             }
             ChainAction::OpenEditor(index) => {
@@ -1459,6 +2000,7 @@ impl MicHostApp {
                     self.last_error = Some(error);
                 }
             }
+            ChainAction::Duplicate(index) => self.begin_duplicate(index),
             ChainAction::Add(descriptor) => self.begin_add(&descriptor),
         }
     }
@@ -1530,14 +2072,14 @@ impl MicHostApp {
 
     fn buffer_options(&self, input: bool) -> Vec<u32> {
         let (devices, selection) = if input {
-            (&self.devices.inputs, &self.project.settings.input)
+            (&self.devices.inputs, &self.device_draft.input)
         } else {
-            (&self.devices.outputs, &self.project.settings.output)
+            (&self.devices.outputs, &self.device_draft.output)
         };
         let current = if input {
-            self.project.settings.buffer_size
+            self.device_draft.buffer_size
         } else {
-            self.project.settings.output_buffer_size
+            self.device_draft.output_buffer_size
         };
         let mut sizes = if let Some(device) = devices
             .iter()
@@ -1553,8 +2095,15 @@ impl MicHostApp {
         };
         if current > 0 && !sizes.contains(&current) {
             sizes.push(current);
-            sizes.sort_unstable();
         }
+        if let Some(actual) = self.actual_buffer(input)
+            && actual > 0
+            && !sizes.contains(&actual)
+        {
+            sizes.push(actual);
+        }
+        sizes.sort_unstable();
+        sizes.dedup();
         sizes
     }
 
@@ -1732,6 +2281,45 @@ impl MicHostApp {
                 Some("the configured output device is not available for measurement".to_string());
             return;
         };
+        let input_selection = self.project.settings.input.clone();
+        let asio_duplex = selection.api == AudioApi::Asio
+            && input_selection.api == AudioApi::Asio
+            && selection.name == input_selection.name;
+        if asio_duplex {
+            let Some(input) = self
+                .devices
+                .inputs
+                .iter()
+                .find(|device| {
+                    device.name == input_selection.name
+                        && device.api == input_selection.api
+                        && device.inputs > 0
+                })
+                .cloned()
+            else {
+                self.last_error = Some(format!(
+                    "the selected ASIO input '{}' is not currently available",
+                    input_selection.name
+                ));
+                return;
+            };
+            let request = MeasureRequest {
+                output,
+                input,
+                output_channels: selection.channels.clamp(1, 2),
+                output_mask: selection.channel_mask,
+                input_channels: input_selection.channels.clamp(1, 8),
+                input_mask: input_selection.channel_mask,
+                output_block: self.project.settings.output_buffer_size,
+                input_block: self.project.settings.buffer_size,
+            };
+            self.measuring = true;
+            self.last_error = None;
+            self.latency_error = None;
+            logging::line("latency measurement: pausing audio for the ASIO duplex loopback");
+            self.stop_audio_async_with_measure(true, Some(request));
+            return;
+        }
         let inputs = backend
             .enumerate_devices(DeviceKind::Input)
             .unwrap_or_else(|_| self.devices.inputs.clone());
@@ -1754,6 +2342,7 @@ impl MicHostApp {
         self.measure_worker = Some(receiver);
         self.measuring = true;
         self.last_error = None;
+        self.latency_error = None;
         logging::line(format!(
             "latency measurement: chain marker -> '{}'",
             input.name
@@ -1792,8 +2381,10 @@ impl MicHostApp {
                             result.p50_ms, result.p95_ms
                         ));
                         self.measured = Some(result);
+                        self.latency_error = None;
                     }
                     Err(error) => {
+                        self.latency_error = Some(error.clone());
                         self.last_error = Some(format!("latency measurement: {error}"));
                     }
                 }
@@ -1804,6 +2395,7 @@ impl MicHostApp {
                     let _ = session.end_chain_measurement();
                 }
                 self.measuring = false;
+                self.latency_error = Some(error.clone());
                 self.last_error = Some(format!("latency measurement: {error}"));
             }
             Err(mpsc::TryRecvError::Empty) => {
@@ -1818,6 +2410,9 @@ impl MicHostApp {
 
     fn show_window(&mut self, ctx: &egui::Context) {
         self.hidden = false;
+        self.hidden_frames = 0;
+        self.hidden_flag.store(false, Ordering::Release);
+        crate::activation::show_window();
         ctx.send_viewport_cmd(ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(ViewportCommand::Focus);
@@ -1830,8 +2425,28 @@ impl MicHostApp {
         }
         self.builtin_editors.clear();
         self.hidden = true;
+        self.hidden_flag.store(true, Ordering::Release);
         crate::activation::hide_window();
         ctx.request_repaint_after(Duration::from_secs(1));
+    }
+
+    /// Keeps a `--hidden`/`--autostart` window out of sight. eframe calls
+    /// `set_visible(true)` once after the first painted frame regardless of
+    /// `with_visible(false)` (eframe 0.32 `EpiIntegration::post_rendering`), so
+    /// the window must be hidden again on each hidden update. The first two
+    /// hidden frames repaint immediately to undo that forced show before it
+    /// can linger. The shared hidden flag then keeps `HiddenWake` posting
+    /// `WM_PAINT` even if eframe briefly left the window visible, so a missed
+    /// follow-up frame cannot leave a black window on screen after login.
+    fn keep_window_hidden(&mut self, ctx: &egui::Context) {
+        self.hidden_flag.store(true, Ordering::Release);
+        crate::activation::hide_window();
+        if hidden_repaint_now(self.hidden_frames) {
+            self.hidden_frames = self.hidden_frames.saturating_add(1);
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
     }
 
     fn show_builtin_editors(&mut self, ctx: &egui::Context) {
@@ -1956,12 +2571,29 @@ impl MicHostApp {
                     };
                     ui.label(text);
                 }
+                EngineState::Stopping => {
+                    ui.spinner();
+                    ui.label("Stopping audio...");
+                }
                 EngineState::Error => {
                     if let Some(remaining) = retrying_in {
                         ui.label(format!("retrying in {:.0} s", remaining.as_secs_f32()));
                     }
                 }
                 EngineState::Stopped | EngineState::Running => {}
+            }
+            if !self.device_draft.matches(&self.project.settings) {
+                let apply = ui
+                    .add_enabled(
+                        !self.measuring,
+                        egui::Button::new(egui::RichText::new("Apply device changes").strong())
+                            .fill(egui::Color32::from_rgb(210, 145, 40)),
+                    )
+                    .on_hover_text("Restart audio with the selected devices and channels")
+                    .on_disabled_hover_text("Wait for the latency measurement to finish");
+                if apply.clicked() {
+                    self.commit_device_draft();
+                }
             }
             let monitor_available = self.monitor_selection().is_some();
             let monitor_active = self.monitor;
@@ -2242,7 +2874,49 @@ It excludes the cable pipe and capture engine. Use Measure to run the chain-incl
         ui.heading("Audio");
         ui.add_space(6.0);
 
-        let mut changed = false;
+        let pending = !self.device_draft.matches(&self.project.settings);
+        let mut apply = false;
+        let mut revert = false;
+        if pending {
+            egui::Frame::group(ui.style())
+                .fill(egui::Color32::from_rgb(60, 52, 24))
+                .inner_margin(egui::Margin::same(8))
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new("Device selection changed")
+                                .strong()
+                                .color(egui::Color32::from_rgb(255, 220, 120)),
+                        );
+                        ui.label(
+                            egui::RichText::new("Apply to restart audio with the new selection.")
+                                .color(egui::Color32::from_rgb(230, 210, 160)),
+                        );
+                        if ui
+                            .add_enabled(
+                                !self.measuring,
+                                egui::Button::new(egui::RichText::new("Apply").strong())
+                                    .fill(egui::Color32::from_rgb(210, 145, 40)),
+                            )
+                            .on_disabled_hover_text("Wait for the latency measurement to finish")
+                            .clicked()
+                        {
+                            apply = true;
+                        }
+                        if ui.button("Revert").clicked() {
+                            revert = true;
+                        }
+                    });
+                });
+            ui.add_space(6.0);
+        }
+        if apply {
+            self.commit_device_draft();
+        }
+        if revert {
+            self.device_draft = DeviceDraft::from_settings(&self.project.settings);
+        }
+
         let combo_width = 240.0;
 
         ui.label(egui::RichText::new("INPUT").strong());
@@ -2252,22 +2926,27 @@ It excludes the cable pipe and capture engine. Use Measure to run the chain-incl
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
                 ui.label("API");
-                let mut api = self.project.settings.input.api;
+                let mut api = self.device_draft.input.api;
                 if advanced {
-                    egui::ComboBox::from_id_salt("input_api")
-                        .selected_text(api_label(api))
-                        .width(combo_width)
-                        .show_ui(ui, |ui| {
-                            for option in API_OPTIONS {
-                                ui.selectable_value(&mut api, option, api_label(option));
-                            }
-                        });
+                    let apis = available_apis(&self.devices.inputs, true);
+                    if apis.len() <= 1 {
+                        ui.label(egui::RichText::new(api_label(api)).weak());
+                    } else {
+                        egui::ComboBox::from_id_salt("input_api")
+                            .selected_text(api_label(api))
+                            .width(combo_width)
+                            .show_ui(ui, |ui| {
+                                for &option in &apis {
+                                    ui.selectable_value(&mut api, option, api_label(option));
+                                }
+                            });
+                    }
                     ui.end_row();
-                    if api != self.project.settings.input.api {
-                        let mut selection = self.project.settings.input.clone();
-                        set_selection_api(&self.devices.inputs, &mut selection, api, true);
-                        self.project.settings.input = selection;
-                        changed = true;
+                    if api != self.device_draft.input.api {
+                        let mut selection = self.device_draft.input.clone();
+                        if switch_selection_api(&self.devices.inputs, &mut selection, api, true) {
+                            self.device_draft.input = selection;
+                        }
                     }
                 } else {
                     ui.label(egui::RichText::new(automatic_api_label(api)).weak());
@@ -2285,92 +2964,67 @@ It excludes the cable pipe and capture engine. Use Measure to run the chain-incl
                 } else {
                     unique_device_names(&self.devices.inputs, true)
                 };
-                let selected = if self.project.settings.input.name.is_empty() {
+                let selected = if self.device_draft.input.name.is_empty() {
                     "Select input".to_string()
                 } else {
-                    self.project.settings.input.name.clone()
+                    self.device_draft.input.name.clone()
                 };
-                let mut chosen = selected.clone();
-                egui::ComboBox::from_id_salt("input_device")
-                    .selected_text(&selected)
-                    .width(combo_width)
-                    .show_ui(ui, |ui| {
-                        for name in &inputs {
-                            ui.selectable_value(&mut chosen, name.clone(), name);
+                if inputs.len() <= 1 {
+                    if let Some(only) = inputs.first() {
+                        ui.label(egui::RichText::new(only).weak());
+                        if only != &selected {
+                            self.select_input(only);
                         }
-                    });
-                ui.end_row();
-                if chosen != selected {
-                    self.select_input(&chosen);
+                    } else {
+                        ui.label(egui::RichText::new("No devices").weak());
+                    }
+                } else {
+                    let mut chosen = selected.clone();
+                    egui::ComboBox::from_id_salt("input_device")
+                        .selected_text(&selected)
+                        .width(combo_width)
+                        .show_ui(ui, |ui| {
+                            for name in &inputs {
+                                ui.selectable_value(&mut chosen, name.clone(), name);
+                            }
+                        });
+                    if chosen != selected {
+                        self.select_input(&chosen);
+                    }
                 }
+                ui.end_row();
 
-                ui.label("Channels");
-                let max_input_channels = self
+                let available_inputs = self
                     .devices
                     .inputs
                     .iter()
                     .find(|device| {
-                        device.api == self.project.settings.input.api
-                            && device.name == self.project.settings.input.name
+                        device.api == self.device_draft.input.api
+                            && device.name == self.device_draft.input.name
                     })
-                    .map(|device| device.inputs.clamp(1, 8))
-                    .unwrap_or(8);
-                let mut input_channels = self
-                    .project
-                    .settings
-                    .input
-                    .channels
-                    .clamp(1, max_input_channels);
-                let has_two = max_input_channels >= 2;
-                let mut mono = if has_two {
-                    self.project.settings.input_mono_source
+                    .map(|device| device.inputs)
+                    .unwrap_or(0);
+                ui.label("Channels");
+                if available_inputs <= 1 {
+                    normalize_selection_channels(&mut self.device_draft.input, available_inputs, 8);
+                    ui.label(
+                        egui::RichText::new(if available_inputs == 1 {
+                            "Ch 1"
+                        } else {
+                            "No channels"
+                        })
+                        .weak(),
+                    );
                 } else {
-                    MonoSource::Left
-                };
-                ui.horizontal(|ui| {
-                    egui::ComboBox::from_id_salt("input_channels")
-                        .selected_text(channel_label(input_channels))
-                        .width(150.0)
-                        .show_ui(ui, |ui| {
-                            for count in 1..=max_input_channels {
-                                ui.selectable_value(
-                                    &mut input_channels,
-                                    count,
-                                    channel_label(count),
-                                );
-                            }
-                        });
-                    if input_channels == 1 {
-                        let mono_row = ui.add_enabled_ui(has_two, |ui| {
-                            egui::ComboBox::from_id_salt("input_mono_source")
-                                .selected_text(mono_label(mono))
-                                .width(80.0)
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut mono, MonoSource::Left, "Left");
-                                    ui.selectable_value(&mut mono, MonoSource::Right, "Right");
-                                });
-                        });
-                        if !has_two {
-                            mono_row.response.on_disabled_hover_text(
-                                "The selected input has fewer than 2 channels; mono left is used.",
-                            );
-                        }
-                    }
-                });
+                    channel_mask_editor(
+                        ui,
+                        "input_channels",
+                        available_inputs,
+                        &mut self.device_draft.input,
+                        8,
+                    );
+                }
                 ui.end_row();
-                if input_channels != self.project.settings.input.channels {
-                    self.project.settings.input.channels = input_channels;
-                    changed = true;
-                }
-                if has_two {
-                    if mono != self.project.settings.input_mono_source {
-                        self.project.settings.input_mono_source = mono;
-                        changed = true;
-                    }
-                } else if self.project.settings.input_mono_source != MonoSource::Left {
-                    self.project.settings.input_mono_source = MonoSource::Left;
-                    changed = true;
-                }
             });
 
         ui.add_space(6.0);
@@ -2379,70 +3033,28 @@ It excludes the cable pipe and capture engine. Use Measure to run the chain-incl
             .num_columns(2)
             .spacing([8.0, 6.0])
             .show(ui, |ui| {
-                ui.label("Output");
-                let project_kind = self.project.settings.output_kind;
-                let mut output_kind = if cfg!(debug_assertions) {
-                    project_kind
-                } else {
-                    OutputKind::Device
-                };
-                egui::ComboBox::from_id_salt("output_kind")
-                    .selected_text(output_kind_label(output_kind))
-                    .width(combo_width)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut output_kind, OutputKind::Device, "Device");
-                        #[cfg(debug_assertions)]
-                        ui.selectable_value(
-                            &mut output_kind,
-                            OutputKind::VirtualMic,
-                            "MicHost Virtual Microphone",
-                        );
-                    });
-                ui.end_row();
-                if cfg!(debug_assertions) && output_kind != project_kind {
-                    self.project.settings.output_kind = output_kind;
-                    changed = true;
-                }
-
-                #[cfg(debug_assertions)]
-                if output_kind == OutputKind::VirtualMic {
-                    ui.label("Driver");
-                    if self.vmic_installed {
-                        ui.label(egui::RichText::new("Installed").monospace());
+                ui.label("API");
+                let mut api = self.device_draft.output.api;
+                if advanced {
+                    let apis = available_apis(&self.devices.outputs, false);
+                    if apis.len() <= 1 {
+                        ui.label(egui::RichText::new(api_label(api)).weak());
                     } else {
-                        ui.label(egui::RichText::new("Not installed").monospace())
-                            .on_hover_text(
-                                "The MicHost Virtual Microphone driver is a separate install. Without it the configured physical output is used.",
-                            );
+                        egui::ComboBox::from_id_salt("output_api")
+                            .selected_text(api_label(api))
+                            .width(combo_width)
+                            .show_ui(ui, |ui| {
+                                for &option in &apis {
+                                    ui.selectable_value(&mut api, option, api_label(option));
+                                }
+                            });
                     }
                     ui.end_row();
-                    ui.label("Status");
-                    ui.label(
-                        egui::RichText::new(
-                            "Install the driver separately, then select it as the app's microphone.",
-                        )
-                        .weak(),
-                    );
-                    ui.end_row();
-                }
-                if output_kind == OutputKind::Device {
-                ui.label("API");
-                let mut api = self.project.settings.output.api;
-                if advanced {
-                    egui::ComboBox::from_id_salt("output_api")
-                        .selected_text(api_label(api))
-                        .width(combo_width)
-                        .show_ui(ui, |ui| {
-                            for option in API_OPTIONS {
-                                ui.selectable_value(&mut api, option, api_label(option));
-                            }
-                        });
-                    ui.end_row();
-                    if api != self.project.settings.output.api {
-                        let mut selection = self.project.settings.output.clone();
-                        set_selection_api(&self.devices.outputs, &mut selection, api, false);
-                        self.project.settings.output = selection;
-                        changed = true;
+                    if api != self.device_draft.output.api {
+                        let mut selection = self.device_draft.output.clone();
+                        if switch_selection_api(&self.devices.outputs, &mut selection, api, false) {
+                            self.device_draft.output = selection;
+                        }
                     }
                 } else {
                     ui.label(egui::RichText::new(automatic_api_label(api)).weak());
@@ -2460,67 +3072,96 @@ It excludes the cable pipe and capture engine. Use Measure to run the chain-incl
                 } else {
                     unique_device_names(&self.devices.outputs, false)
                 };
-                let selected = if self.project.settings.output.name.is_empty() {
+                let selected = if self.device_draft.output.name.is_empty() {
                     "Select output".to_string()
                 } else {
-                    self.project.settings.output.name.clone()
+                    self.device_draft.output.name.clone()
                 };
-                let mut chosen = selected.clone();
-                egui::ComboBox::from_id_salt("output_device")
-                    .selected_text(&selected)
-                    .width(combo_width)
-                    .show_ui(ui, |ui| {
-                        for name in &outputs {
-                            ui.selectable_value(&mut chosen, name.clone(), name);
+                if outputs.len() <= 1 {
+                    if let Some(only) = outputs.first() {
+                        ui.label(egui::RichText::new(only).weak());
+                        if only != &selected {
+                            self.select_output(only);
                         }
-                    });
-                ui.end_row();
-                if chosen != selected {
-                    self.select_output(&chosen);
-                }
-
-                ui.label("Channels");
-                let mut output_channels = self.project.settings.output.channels.clamp(1, 2);
-                egui::ComboBox::from_id_salt("output_channels")
-                    .selected_text(if output_channels == 1 {
-                        "1 (mono)".to_string()
                     } else {
-                        "2 (stereo)".to_string()
-                    })
-                    .width(combo_width)
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut output_channels, 1, "1 (mono)");
-                        ui.selectable_value(&mut output_channels, 2, "2 (stereo)");
-                    });
+                        ui.label(egui::RichText::new("No devices").weak());
+                    }
+                } else {
+                    let mut chosen = selected.clone();
+                    egui::ComboBox::from_id_salt("output_device")
+                        .selected_text(&selected)
+                        .width(combo_width)
+                        .show_ui(ui, |ui| {
+                            for name in &outputs {
+                                ui.selectable_value(&mut chosen, name.clone(), name);
+                            }
+                        });
+                    if chosen != selected {
+                        self.select_output(&chosen);
+                    }
+                }
                 ui.end_row();
-                if output_channels != self.project.settings.output.channels {
-                    self.project.settings.output.channels = output_channels;
-                    changed = true;
+
+                let available_outputs = self
+                    .devices
+                    .outputs
+                    .iter()
+                    .find(|device| {
+                        device.api == self.device_draft.output.api
+                            && device.name == self.device_draft.output.name
+                    })
+                    .map(|device| device.outputs)
+                    .unwrap_or(0);
+                ui.label("Channels");
+                if available_outputs <= 1 {
+                    normalize_selection_channels(
+                        &mut self.device_draft.output,
+                        available_outputs,
+                        2,
+                    );
+                    ui.label(
+                        egui::RichText::new(if available_outputs == 1 {
+                            "Ch 1"
+                        } else {
+                            "No channels"
+                        })
+                        .weak(),
+                    );
+                } else {
+                    channel_mask_editor(
+                        ui,
+                        "output_channels",
+                        available_outputs,
+                        &mut self.device_draft.output,
+                        2,
+                    );
                 }
-                }
+                ui.end_row();
             });
 
         ui.add_space(6.0);
         egui::CollapsingHeader::new("SECOND INPUT (SIDECHAIN)")
-            .default_open(self.project.settings.sidechain_input_enabled)
+            .default_open(self.device_draft.sidechain_input_enabled)
             .show(ui, |ui| {
-                let mut enabled = self.project.settings.sidechain_input_enabled;
+                let mut enabled = self.device_draft.sidechain_input_enabled;
                 if ui
                     .checkbox(&mut enabled, "Enable second input device")
+                    .on_hover_text(
+                        "The second input is for plugin sidechains; it may use a different device and API.",
+                    )
                     .changed()
                 {
-                    self.project.settings.sidechain_input_enabled = enabled;
-                    if enabled && self.project.settings.sidechain_input.name.is_empty() {
+                    self.device_draft.sidechain_input_enabled = enabled;
+                    if enabled && self.device_draft.sidechain_input.name.is_empty() {
                         if let Some(device) = self.devices.inputs.iter().find(|device| {
                             device.inputs > 0
-                                && !(device.name == self.project.settings.input.name
-                                    && device.api == self.project.settings.input.api)
+                                && !(device.name == self.device_draft.input.name
+                                    && device.api == self.device_draft.input.api)
                         }) {
-                            self.project.settings.sidechain_input =
+                            self.device_draft.sidechain_input =
                                 selection_for(device, device.inputs.min(2));
                         }
                     }
-                    changed = true;
                 }
                 ui.add_enabled_ui(enabled, |ui| {
                     egui::Grid::new("sidechain_settings")
@@ -2528,32 +3169,37 @@ It excludes the cable pipe and capture engine. Use Measure to run the chain-incl
                         .spacing([8.0, 6.0])
                         .show(ui, |ui| {
                             ui.label("API");
-                            let mut api = self.project.settings.sidechain_input.api;
+                            let mut api = self.device_draft.sidechain_input.api;
                             if advanced {
-                                egui::ComboBox::from_id_salt("sidechain_api")
-                                    .selected_text(api_label(api))
-                                    .width(combo_width)
-                                    .show_ui(ui, |ui| {
-                                        for option in API_OPTIONS {
-                                            ui.selectable_value(
-                                                &mut api,
-                                                option,
-                                                api_label(option),
-                                            );
-                                        }
-                                    });
+                                let apis = available_apis(&self.devices.inputs, true);
+                                if apis.len() <= 1 {
+                                    ui.label(egui::RichText::new(api_label(api)).weak());
+                                } else {
+                                    egui::ComboBox::from_id_salt("sidechain_api")
+                                        .selected_text(api_label(api))
+                                        .width(combo_width)
+                                        .show_ui(ui, |ui| {
+                                            for &option in &apis {
+                                                ui.selectable_value(
+                                                    &mut api,
+                                                    option,
+                                                    api_label(option),
+                                                );
+                                            }
+                                        });
+                                }
                                 ui.end_row();
-                                if api != self.project.settings.sidechain_input.api {
+                                if api != self.device_draft.sidechain_input.api {
                                     let mut selection =
-                                        self.project.settings.sidechain_input.clone();
-                                    set_selection_api(
+                                        self.device_draft.sidechain_input.clone();
+                                    if switch_selection_api(
                                         &self.devices.inputs,
                                         &mut selection,
                                         api,
                                         true,
-                                    );
-                                    self.project.settings.sidechain_input = selection;
-                                    changed = true;
+                                    ) {
+                                        self.device_draft.sidechain_input = selection;
+                                    }
                                 }
                             } else {
                                 ui.label(egui::RichText::new(automatic_api_label(api)).weak());
@@ -2566,7 +3212,7 @@ It excludes the cable pipe and capture engine. Use Measure to run the chain-incl
                                     .inputs
                                     .iter()
                                     .filter(|device| {
-                                        device.api == self.project.settings.sidechain_input.api
+                                        device.api == self.device_draft.sidechain_input.api
                                             && device.inputs > 0
                                     })
                                     .map(|device| device.name.clone())
@@ -2574,60 +3220,71 @@ It excludes the cable pipe and capture engine. Use Measure to run the chain-incl
                             } else {
                                 unique_device_names(&self.devices.inputs, true)
                             };
-                            let selected = if self.project.settings.sidechain_input.name.is_empty()
-                            {
+                            let selected = if self.device_draft.sidechain_input.name.is_empty() {
                                 "Select sidechain".to_string()
                             } else {
-                                self.project.settings.sidechain_input.name.clone()
+                                self.device_draft.sidechain_input.name.clone()
                             };
-                            let mut chosen = selected.clone();
-                            egui::ComboBox::from_id_salt("sidechain_device")
-                                .selected_text(&selected)
-                                .width(combo_width)
-                                .show_ui(ui, |ui| {
-                                    for name in &inputs {
-                                        ui.selectable_value(&mut chosen, name.clone(), name);
+                            if inputs.len() <= 1 {
+                                if let Some(only) = inputs.first() {
+                                    ui.label(egui::RichText::new(only).weak());
+                                    if only != &selected {
+                                        self.select_sidechain_input(only);
                                     }
-                                });
-                            ui.end_row();
-                            if chosen != selected {
-                                self.select_sidechain_input(&chosen);
+                                } else {
+                                    ui.label(egui::RichText::new("No devices").weak());
+                                }
+                            } else {
+                                let mut chosen = selected.clone();
+                                egui::ComboBox::from_id_salt("sidechain_device")
+                                    .selected_text(&selected)
+                                    .width(combo_width)
+                                    .show_ui(ui, |ui| {
+                                        for name in &inputs {
+                                            ui.selectable_value(&mut chosen, name.clone(), name);
+                                        }
+                                    });
+                                if chosen != selected {
+                                    self.select_sidechain_input(&chosen);
+                                }
                             }
+                            ui.end_row();
 
-                            ui.label("Channels");
-                            let max_sidechain_channels = self
+                            let available = self
                                 .devices
                                 .inputs
                                 .iter()
                                 .find(|device| {
-                                    device.api == self.project.settings.sidechain_input.api
-                                        && device.name == self.project.settings.sidechain_input.name
+                                    device.api == self.device_draft.sidechain_input.api
+                                        && device.name == self.device_draft.sidechain_input.name
                                 })
-                                .map(|device| device.inputs.clamp(1, 8))
-                                .unwrap_or(8);
-                            let mut channels = self
-                                .project
-                                .settings
-                                .sidechain_input
-                                .channels
-                                .clamp(1, max_sidechain_channels);
-                            egui::ComboBox::from_id_salt("sidechain_channels")
-                                .selected_text(channel_label(channels))
-                                .width(combo_width)
-                                .show_ui(ui, |ui| {
-                                    for count in 1..=max_sidechain_channels {
-                                        ui.selectable_value(
-                                            &mut channels,
-                                            count,
-                                            channel_label(count),
-                                        );
-                                    }
-                                });
-                            ui.end_row();
-                            if channels != self.project.settings.sidechain_input.channels {
-                                self.project.settings.sidechain_input.channels = channels;
-                                changed = true;
+                                .map(|device| device.inputs)
+                                .unwrap_or(0);
+                            ui.label("Channels");
+                            if available <= 1 {
+                                normalize_selection_channels(
+                                    &mut self.device_draft.sidechain_input,
+                                    available,
+                                    8,
+                                );
+                                ui.label(
+                                    egui::RichText::new(if available == 1 {
+                                        "Ch 1"
+                                    } else {
+                                        "No channels"
+                                    })
+                                    .weak(),
+                                );
+                            } else {
+                                channel_mask_editor(
+                                    ui,
+                                    "sidechain_channels",
+                                    available,
+                                    &mut self.device_draft.sidechain_input,
+                                    8,
+                                );
                             }
+                            ui.end_row();
                         });
                 });
             });
@@ -2647,7 +3304,7 @@ It excludes the cable pipe and capture engine. Use Measure to run the chain-incl
                     ui.label("Safety buffer").on_hover_text(
                         "Extra output queue. Auto is safest; a smaller value lowers latency but may underrun.",
                     );
-                    let mut safety = self.project.settings.safety_buffer_ms;
+                    let mut safety = self.device_draft.safety_buffer_ms;
                     egui::ComboBox::from_id_salt("safety_buffer")
                         .selected_text(if safety == 0 {
                             "Auto".to_string()
@@ -2661,19 +3318,25 @@ It excludes the cable pipe and capture engine. Use Measure to run the chain-incl
                                 ui.selectable_value(&mut safety, option, format!("{option} ms"));
                             }
                         });
-                    if safety != self.project.settings.safety_buffer_ms {
-                        self.project.settings.safety_buffer_ms = safety;
-                        changed = true;
-                    }
+                    self.device_draft.safety_buffer_ms = safety;
                 });
                 ui.add_space(10.0);
             }
             ui.vertical(|ui| {
                 ui.label("Sample rate");
-                let mut rate = self.project.settings.sample_rate;
+                let mut rate = self.device_draft.sample_rate;
+                let actual_rate = self
+                    .session
+                    .as_ref()
+                    .map(|session| session.input().sample_rate)
+                    .unwrap_or(0.0);
                 egui::ComboBox::from_id_salt("sample_rate")
                     .selected_text(if rate <= 0.0 {
-                        "Device default".to_string()
+                        if actual_rate > 0.0 {
+                            format!("Device default ({actual_rate:.0} Hz)")
+                        } else {
+                            "Device default".to_string()
+                        }
                     } else {
                         format!("{rate:.0} Hz")
                     })
@@ -2684,10 +3347,7 @@ It excludes the cable pipe and capture engine. Use Measure to run the chain-incl
                             ui.selectable_value(&mut rate, option, format!("{option:.0} Hz"));
                         }
                     });
-                if rate != self.project.settings.sample_rate {
-                    self.project.settings.sample_rate = rate;
-                    changed = true;
-                }
+                self.device_draft.sample_rate = rate;
             });
         });
 
@@ -2696,7 +3356,7 @@ It excludes the cable pipe and capture engine. Use Measure to run the chain-incl
                 ui.label("Input buffer").on_hover_text(
                     "Input device and graph block. Independent of the output buffer. 0 uses the device default.",
                 );
-                let mut buffer = self.project.settings.buffer_size;
+                let mut buffer = self.device_draft.buffer_size;
                 egui::ComboBox::from_id_salt("buffer_size")
                     .selected_text(if buffer == 0 {
                         input_default_label.clone()
@@ -2714,10 +3374,7 @@ It excludes the cable pipe and capture engine. Use Measure to run the chain-incl
                             );
                         }
                     });
-                if buffer != self.project.settings.buffer_size {
-                    self.project.settings.buffer_size = buffer;
-                    changed = true;
-                }
+                self.device_draft.buffer_size = buffer;
             });
             if !virtual_mic_output {
                 ui.add_space(10.0);
@@ -2725,7 +3382,7 @@ It excludes the cable pipe and capture engine. Use Measure to run the chain-incl
                     ui.label("Output buffer").on_hover_text(
                         "Output device buffer, independent of the input. Lower values reduce the host output queue but may underrun. 0 uses the device default.",
                     );
-                    let mut output_buffer = self.project.settings.output_buffer_size;
+                    let mut output_buffer = self.device_draft.output_buffer_size;
                     egui::ComboBox::from_id_salt("output_buffer_size")
                         .selected_text(if output_buffer == 0 {
                             output_default_label.clone()
@@ -2743,21 +3400,22 @@ It excludes the cable pipe and capture engine. Use Measure to run the chain-incl
                                 );
                             }
                         });
-                    if output_buffer != self.project.settings.output_buffer_size {
-                        self.project.settings.output_buffer_size = output_buffer;
-                        changed = true;
-                    }
+                    self.device_draft.output_buffer_size = output_buffer;
                 });
             }
         });
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label("Chain latency").on_hover_text(
-                "Run a 2 s chain-inclusive marker test: a click train is injected before the plugin chain and captured at the configured output. Audio keeps running; the marker is briefly audible in the virtual mic.",
+                "Run a 2 s marker test. WASAPI cable routing keeps audio running and measures the chain marker to the cable. For ASIO input and output on the same device, audio pauses for 2 s and measures the selected output -> physical loopback -> selected input round trip; that excludes the plugin chain.",
             );
             if self.measuring {
                 ui.spinner();
-                ui.label("Measuring chain...");
+                ui.label(if self.session.is_none() {
+                    "Measuring ASIO loopback (audio paused)..."
+                } else {
+                    "Measuring chain..."
+                });
             } else if ui.button("Measure").clicked() {
                 self.request_measure();
             }
@@ -2772,6 +3430,26 @@ Includes graph, plugin chain, host output queue, output device, cable and captur
                     measured.matched,
                     measured.clicks
                 ));
+            }
+            if let Some(error) = &self.latency_error {
+                ui.label(
+                    egui::RichText::new("Measurement failed")
+                        .color(egui::Color32::from_rgb(235, 120, 105)),
+                )
+                .on_hover_text(error);
+            }
+            if let Some(round_trip) = &self.asio_round_trip {
+                ui.label(format!("ASIO loopback {:.1} ms", round_trip.p50_ms))
+                    .on_hover_text(format!(
+                        "Measured ASIO output -> physical loopback -> ASIO input round trip: p50 {:.1} ms, p95 {:.1} ms (min {:.1}, max {:.1}); {} matched of {} clicks.
+Includes the ASIO output and input buffers and the loopback; excludes the plugin chain, host graph and queue. Use the host estimate for total latency. The output and input must be the same ASIO device and the loopback must reach the first selected input channel.",
+                        round_trip.p50_ms,
+                        round_trip.p95_ms,
+                        round_trip.min_ms,
+                        round_trip.max_ms,
+                        round_trip.matched,
+                        round_trip.clicks
+                    ));
             }
         });
 
@@ -2800,16 +3478,15 @@ Includes graph, plugin chain, host output queue, output device, cable and captur
             .inner;
         if advanced_toggled {
             self.project.settings.advanced_mode = advanced_mode;
-            let api_changed = if advanced_mode {
-                false
-            } else {
-                self.apply_automatic_apis()
-            };
-            if api_changed {
-                self.settings_changed();
-            } else {
-                self.mark_dirty();
+            if !advanced_mode {
+                let mut candidate = self.project.settings.clone();
+                if apply_automatic_apis_to(&self.devices, &mut candidate) {
+                    self.device_draft.input = candidate.input;
+                    self.device_draft.output = candidate.output;
+                    self.device_draft.sidechain_input = candidate.sidechain_input;
+                }
             }
+            self.mark_dirty();
         }
         if close_toggled {
             self.project.settings.close_to_tray = close_to_tray;
@@ -2823,9 +3500,6 @@ Includes graph, plugin chain, host output queue, output device, cable and captur
                 }
                 Err(error) => self.last_error = Some(error),
             }
-        }
-        if changed {
-            self.settings_changed();
         }
     }
 
@@ -2906,37 +3580,30 @@ Includes graph, plugin chain, host output queue, output device, cable and captur
                 } else {
                     ui.horizontal(|ui| {
                         ui.label("API");
-                        let mut apis: Vec<AudioApi> = Vec::new();
-                        for device in outputs.iter().filter(|device| device.outputs > 0) {
-                            if !apis.contains(&device.api) {
-                                apis.push(device.api);
-                            }
-                        }
-                        egui::ComboBox::from_id_salt("monitor_api")
-                            .selected_text(api_label(selection.api))
-                            .width(150.0)
-                            .show_ui(ui, |ui| {
-                                for api in apis {
-                                    if ui
-                                        .selectable_value(
-                                            &mut selection.api,
-                                            api,
-                                            api_label(api),
-                                        )
-                                        .changed()
-                                    {
-                                        if let Some(device) = outputs.iter().find(|device| {
-                                            device.outputs > 0 && device.api == api
-                                        }) {
-                                            selection = selection_for(
-                                                device,
-                                                device.outputs.min(2),
-                                            );
+                        let apis = available_apis(outputs, false);
+                        if apis.len() <= 1 {
+                            ui.label(egui::RichText::new(api_label(selection.api)).weak());
+                        } else {
+                            egui::ComboBox::from_id_salt("monitor_api")
+                                .selected_text(api_label(selection.api))
+                                .width(150.0)
+                                .show_ui(ui, |ui| {
+                                    for api in apis {
+                                        let selected = selection.api == api;
+                                        if ui.selectable_label(selected, api_label(api)).clicked()
+                                            && !selected
+                                            && switch_selection_api(
+                                                outputs,
+                                                &mut selection,
+                                                api,
+                                                false,
+                                            )
+                                        {
+                                            changed = true;
                                         }
-                                        changed = true;
                                     }
-                                }
-                            });
+                                });
+                        }
                     });
                     ui.horizontal(|ui| {
                         ui.label("Device");
@@ -2946,30 +3613,49 @@ Includes graph, plugin chain, host output queue, output device, cable and captur
                             short_text(&selection.name, 34)
                         };
                         let selected_api = selection.api;
-                        egui::ComboBox::from_id_salt("monitor_device")
-                            .selected_text(selected)
-                            .width(240.0)
-                            .show_ui(ui, |ui| {
-                                for device in outputs.iter().filter(|device| {
-                                    device.outputs > 0 && device.api == selected_api
-                                }) {
-                                    if ui
-                                        .selectable_value(
-                                            &mut selection.name,
-                                            device.name.clone(),
-                                            short_text(&device.name, 40),
-                                        )
-                                        .on_hover_text(&device.name)
-                                        .changed()
-                                    {
-                                        selection = selection_for(
-                                            device,
-                                            device.outputs.min(2),
-                                        );
-                                        changed = true;
-                                    }
+                        let mut devices: Vec<_> = outputs
+                            .iter()
+                            .filter(|device| {
+                                device.outputs > 0 && device.api == selected_api
+                            })
+                            .collect();
+                        if devices.len() <= 1 {
+                            if let Some(device) = devices.first() {
+                                ui.label(
+                                    egui::RichText::new(short_text(&device.name, 40))
+                                        .weak(),
+                                );
+                                if selection.name != device.name {
+                                    selection = selection_for(device, device.outputs.min(2));
+                                    changed = true;
                                 }
-                            });
+                            } else {
+                                ui.label(egui::RichText::new("No devices").weak());
+                            }
+                        } else {
+                            egui::ComboBox::from_id_salt("monitor_device")
+                                .selected_text(selected)
+                                .width(240.0)
+                                .show_ui(ui, |ui| {
+                                    for device in devices.drain(..) {
+                                        if ui
+                                            .selectable_value(
+                                                &mut selection.name,
+                                                device.name.clone(),
+                                                short_text(&device.name, 40),
+                                            )
+                                            .on_hover_text(&device.name)
+                                            .changed()
+                                        {
+                                            selection = selection_for(
+                                                device,
+                                                device.outputs.min(2),
+                                            );
+                                            changed = true;
+                                        }
+                                    }
+                                });
+                        }
                     });
                     let max_outputs = outputs
                         .iter()
@@ -2982,56 +3668,25 @@ Includes graph, plugin chain, host output queue, output device, cable and captur
                         .unwrap_or(0);
                     ui.horizontal(|ui| {
                         ui.label("Output");
-                        let current_start = if selection.channel_mask != 0 {
-                            selection.channel_mask.trailing_zeros() & !1
-                        } else {
-                            0
-                        };
-                        let current_len = selection.channels.clamp(1, 2);
-                        let current_label = if max_outputs <= 1 {
-                            "Ch 1".to_string()
-                        } else if current_len == 1 {
-                            format!("Ch {}", current_start + 1)
-                        } else {
-                            format!(
-                                "Ch {}-{}",
-                                current_start + 1,
-                                (current_start + 2).min(max_outputs)
-                            )
-                        };
-                        egui::ComboBox::from_id_salt("monitor_channels")
-                            .selected_text(current_label)
-                            .width(110.0)
-                            .show_ui(ui, |ui| {
-                                if max_outputs <= 1 {
-                                    ui.label("Ch 1");
+                        if max_outputs <= 1 {
+                            normalize_selection_channels(&mut selection, max_outputs, 2);
+                            ui.label(
+                                egui::RichText::new(if max_outputs == 1 {
+                                    "Ch 1"
                                 } else {
-                                    for start in (0..max_outputs).step_by(2) {
-                                        let end = (start + 2).min(max_outputs);
-                                        let mask = if end == start + 1 {
-                                            1u64 << start
-                                        } else {
-                                            (3u64 << start) & ((1u64 << end) - 1)
-                                        };
-                                        let label = if end == start + 1 {
-                                            format!("Ch {}", start + 1)
-                                        } else {
-                                            format!("Ch {}-{}", start + 1, end)
-                                        };
-                                        if ui
-                                            .selectable_value(
-                                                &mut selection.channel_mask,
-                                                mask,
-                                                label,
-                                            )
-                                            .changed()
-                                        {
-                                            selection.channels = end - start;
-                                            changed = true;
-                                        }
-                                    }
-                                }
-                            });
+                                    "No channels"
+                                })
+                                .weak(),
+                            );
+                        } else {
+                            changed |= channel_mask_editor(
+                                ui,
+                                "monitor_channels",
+                                max_outputs,
+                                &mut selection,
+                                2,
+                            );
+                        }
                     });
                     if outputs.iter().all(|device| {
                         device.outputs == 0
@@ -3125,7 +3780,12 @@ Includes graph, plugin chain, host output queue, output device, cable and captur
         if let Some(pending) = &self.pending_add {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label(format!("Loading {}...", pending.name));
+                let verb = if pending.template.is_some() {
+                    "Duplicating"
+                } else {
+                    "Loading"
+                };
+                ui.label(format!("{verb} {}...", pending.name));
             });
         }
         if !self.add.open {
@@ -3241,10 +3901,80 @@ Includes graph, plugin chain, host output queue, output device, cable and captur
         let (_, payload) = ui.dnd_drop_zone::<usize, _>(frame, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                ui.dnd_drag_source(egui::Id::new(("chain_grip", id)), index, |ui| {
-                    ui.label(egui::RichText::new("::").monospace().size(16.0).weak())
-                        .on_hover_text("Drag to reorder");
-                });
+                let ctx = ui.ctx().clone();
+                let (grip_rect, grip_response) = ui.allocate_exact_size(
+                    egui::vec2(14.0, 18.0),
+                    egui::Sense::drag(),
+                );
+                ui.painter().text(
+                    grip_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "::",
+                    egui::FontId::monospace(16.0),
+                    ui.visuals().weak_text_color(),
+                );
+                let grip_response = grip_response.on_hover_text("Drag to reorder");
+                if grip_response.dragged() {
+                    grip_response.dnd_set_drag_payload(index);
+                    if let Some(position) = ctx.pointer_interact_pos() {
+                        egui::Area::new(egui::Id::new(("chain_drag_preview", id)))
+                            .order(egui::Order::Tooltip)
+                            .fixed_pos(position + egui::vec2(16.0, 12.0))
+                            .show(&ctx, |ui| {
+                                egui::Frame::group(ui.style())
+                                    .fill(ui.visuals().widgets.active.bg_fill)
+                                    .stroke(ui.visuals().widgets.active.bg_stroke)
+                                    .inner_margin(egui::Margin::symmetric(10, 8))
+                                    .show(ui, |ui| {
+                                        ui.set_width(320.0);
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{}. {}",
+                                                    index + 1,
+                                                    name
+                                                ))
+                                                .strong(),
+                                            );
+                                            if !vendor.is_empty() {
+                                                ui.label(egui::RichText::new(&vendor).weak());
+                                            }
+                                        });
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "{} in / {} out",
+                                                    entry.plugin.main_inputs,
+                                                    entry.plugin.main_outputs
+                                                ))
+                                                .weak(),
+                                            );
+                                            if entry.bypassed {
+                                                ui.label(
+                                                    egui::RichText::new("Bypassed").weak(),
+                                                );
+                                            }
+                                            if entry.oversampling > 1 {
+                                                ui.label(
+                                                    egui::RichText::new(format!(
+                                                        "OS {}x",
+                                                        entry.oversampling
+                                                    ))
+                                                    .weak(),
+                                                );
+                                            }
+                                            if entry.sidechain_source
+                                                != SidechainSource::Off
+                                            {
+                                                ui.label(
+                                                    egui::RichText::new("Sidechain").weak(),
+                                                );
+                                            }
+                                        });
+                                    });
+                            });
+                    }
+                }
                 ui.add(
                     egui::Label::new(
                         egui::RichText::new(format!("{}. {}", index + 1, name)).strong(),
@@ -3269,8 +3999,7 @@ Includes graph, plugin chain, host output queue, output device, cable and captur
                 ui.label(egui::RichText::new(bus_text).weak())
                     .on_hover_text("Bus counts are read from the loaded plugin.");
                 let mut bypassed = entry.bypassed;
-                if ui
-                    .checkbox(&mut bypassed, "Bypass")
+                if bypass_checkbox(ui, &mut bypassed)
                     .on_hover_text("Pass audio through this plugin without processing")
                     .changed()
                 {
@@ -3366,6 +4095,19 @@ Includes graph, plugin chain, host output queue, output device, cable and captur
                         .clicked()
                     {
                         action = Some(ChainAction::OpenEditor(index));
+                    }
+                    if ui
+                        .add_enabled(
+                            self.pending_add.is_none(),
+                            egui::Button::new("Duplicate"),
+                        )
+                        .on_disabled_hover_text("Wait for the plugin to finish loading")
+                        .on_hover_text(
+                            "Copy this plugin, including its saved state, after itself",
+                        )
+                        .clicked()
+                    {
+                        action = Some(ChainAction::Duplicate(index));
                     }
             });
             });
@@ -3668,6 +4410,7 @@ impl eframe::App for MicHostApp {
         self.poll_scan();
         self.poll_backend();
         self.poll_session_worker();
+        self.poll_stop_worker();
         if let Some(session) = self.session.as_mut() {
             session.poll_monitor();
         }
@@ -3780,7 +4523,11 @@ impl eframe::App for MicHostApp {
             }
             self.update_tray_tooltip();
             self.ensure_engine(Instant::now());
-            ctx.request_repaint_after(Duration::from_secs(1));
+            if self.hidden && !minimized {
+                self.keep_window_hidden(ctx);
+            } else {
+                ctx.request_repaint_after(Duration::from_secs(1));
+            }
             return;
         }
 
@@ -3816,7 +4563,9 @@ impl eframe::App for MicHostApp {
         self.ensure_engine(Instant::now());
 
         let flash_active = self.saved_flash_until.is_some();
-        let interval = if self.state == EngineState::Running || flash_active {
+        let interval = if self.stop_worker.is_some() || self.session_worker.is_some() {
+            Duration::from_millis(100)
+        } else if self.state == EngineState::Running || flash_active {
             Duration::from_millis(200)
         } else {
             Duration::from_millis(500)
@@ -3900,13 +4649,6 @@ fn monitor_button(ui: &mut egui::Ui, active: bool, enabled: bool) -> egui::Respo
     response
 }
 
-const API_OPTIONS: [AudioApi; 4] = [
-    AudioApi::WasapiShared,
-    AudioApi::WasapiLowLatency,
-    AudioApi::WasapiExclusive,
-    AudioApi::Asio,
-];
-
 fn api_label(api: AudioApi) -> &'static str {
     match api {
         AudioApi::WasapiShared => "WASAPI shared",
@@ -3914,13 +4656,6 @@ fn api_label(api: AudioApi) -> &'static str {
         AudioApi::WasapiExclusive => "WASAPI exclusive",
         AudioApi::Asio => "ASIO",
         AudioApi::Other => "Other",
-    }
-}
-
-fn output_kind_label(kind: OutputKind) -> &'static str {
-    match kind {
-        OutputKind::Device => "Device",
-        OutputKind::VirtualMic => "MicHost Virtual Microphone",
     }
 }
 
@@ -3990,6 +4725,13 @@ fn sidechain_label(source: SidechainSource) -> String {
     }
 }
 
+/// The first two hidden frames must repaint immediately: eframe force-shows
+/// the window once after the first painted frame, so only a follow-up frame
+/// can hide it again. Later hidden frames fall back to the 1 s poll.
+fn hidden_repaint_now(hidden_frames: u8) -> bool {
+    hidden_frames < 2
+}
+
 fn strip_builtins(project: &mut Project, allow: bool) -> Vec<String> {
     if allow {
         Vec::new()
@@ -3998,16 +4740,20 @@ fn strip_builtins(project: &mut Project, allow: bool) -> Vec<String> {
     }
 }
 
-fn load_startup_project() -> (Project, Option<PathBuf>) {
+fn load_startup_project() -> (Project, Option<PathBuf>, Vec<String>) {
     if let Some(path) = project_state::read() {
         if path.is_file() {
             match Project::load(&path) {
                 Ok(mut project) => {
+                    let mut warnings = Vec::new();
                     for name in strip_builtins(&mut project, cfg!(debug_assertions)) {
                         logging::line(format!("release build: removed built-in effect '{name}'"));
+                        warnings.push(format!(
+                            "built-in effect '{name}' is not included in release builds and was removed"
+                        ));
                     }
                     logging::line(format!("loaded project {}", path.display()));
-                    return (project, Some(path));
+                    return (project, Some(path), warnings);
                 }
                 Err(error) => {
                     logging::line(format!("loading last project {}: {error}", path.display()));
@@ -4026,10 +4772,32 @@ fn load_startup_project() -> (Project, Option<PathBuf>) {
             Project::new()
         }
     };
+    let mut warnings = Vec::new();
     for name in strip_builtins(&mut project, cfg!(debug_assertions)) {
         logging::line(format!("release build: removed built-in effect '{name}'"));
+        warnings.push(format!(
+            "built-in effect '{name}' is not included in release builds and was removed"
+        ));
     }
-    (project, None)
+    (project, None, warnings)
+}
+
+fn bypass_checkbox(ui: &mut egui::Ui, bypassed: &mut bool) -> egui::Response {
+    ui.scope(|ui| {
+        let strong = ui.visuals().strong_text_color();
+        let extreme = ui.visuals().extreme_bg_color;
+        let border = egui::Stroke::new(1.5_f32, strong.gamma_multiply(0.9));
+        let visuals = ui.visuals_mut();
+        visuals.widgets.inactive.bg_fill = extreme;
+        visuals.widgets.inactive.bg_stroke = border;
+        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(2.0_f32, strong);
+        visuals.widgets.hovered.bg_stroke = border;
+        visuals.widgets.active.bg_stroke = border;
+        ui.spacing_mut().icon_width = 18.0_f32;
+        ui.spacing_mut().icon_width_inner = 10.0_f32;
+        ui.checkbox(bypassed, "Bypass")
+    })
+    .inner
 }
 
 fn header_stat(ui: &mut egui::Ui, label: &str, value: &str, hover: &str) {
@@ -4082,19 +4850,153 @@ fn short_text(text: &str, max: usize) -> String {
     }
 }
 
-fn channel_label(count: u32) -> String {
-    match count {
-        1 => "1 (mono)".to_string(),
-        2 => "2 (stereo)".to_string(),
-        other => format!("{other} channels"),
+fn channel_limit(available: u32) -> u64 {
+    if available >= 64 {
+        u64::MAX
+    } else if available == 0 {
+        0
+    } else {
+        (1u64 << available) - 1
     }
 }
 
-fn mono_label(source: MonoSource) -> &'static str {
-    match source {
-        MonoSource::Left => "Left",
-        MonoSource::Right => "Right",
+fn default_channel_mask(selection: &DeviceSelection, available: u32) -> u64 {
+    let limit = channel_limit(available);
+    if selection.channel_mask != 0 {
+        return selection.channel_mask & limit;
     }
+    let count = selection.channels.clamp(1, available.max(1)) as u64;
+    if count >= 64 {
+        limit
+    } else {
+        ((1u64 << count) - 1) & limit
+    }
+}
+
+fn normalize_selection_channels(selection: &mut DeviceSelection, available: u32, max: u32) {
+    if available == 0 {
+        return;
+    }
+    let limit = channel_limit(available);
+    if selection.channels == 0 {
+        selection.channels = if max >= 2 { 2 } else { 1 };
+        selection.channel_mask = 0;
+    }
+    if selection.channel_mask != 0 {
+        let masked = selection.channel_mask & limit;
+        let count = masked.count_ones();
+        if masked != selection.channel_mask
+            || count == 0
+            || count > max
+            || count != selection.channels
+        {
+            selection.channel_mask = 0;
+            selection.channels = selection.channels.clamp(1, available.min(max).max(1));
+        }
+    } else if selection.channels > available || selection.channels > max {
+        selection.channels = selection.channels.clamp(1, available.min(max).max(1));
+    }
+}
+
+fn channel_mask_label(mask: u64, available: u32) -> String {
+    let limit = channel_limit(available);
+    let mut mask = mask & limit;
+    if mask == 0 && available > 0 {
+        mask = 1;
+    }
+    let mut parts = Vec::new();
+    let mut channel = 0u32;
+    while channel < available.min(64) {
+        if mask & (1u64 << channel) == 0 {
+            channel += 1;
+            continue;
+        }
+        let start = channel;
+        while channel + 1 < available && channel + 1 < 64 && mask & (1u64 << (channel + 1)) != 0 {
+            channel += 1;
+        }
+        if start == channel {
+            parts.push(format!("{}", start + 1));
+        } else {
+            parts.push(format!("{}-{}", start + 1, channel + 1));
+        }
+        channel += 1;
+    }
+    if parts.is_empty() {
+        "Select channels".to_string()
+    } else {
+        format!("Ch {}", parts.join(", "))
+    }
+}
+
+fn channel_mask_editor(
+    ui: &mut egui::Ui,
+    id: &str,
+    available: u32,
+    selection: &mut DeviceSelection,
+    max_selected: u32,
+) -> bool {
+    if available == 0 {
+        ui.label(egui::RichText::new("No channels").weak());
+        return false;
+    }
+    let limit = channel_limit(available);
+    normalize_selection_channels(selection, available, max_selected);
+    let mut mask = default_channel_mask(selection, available);
+    let mut changed = false;
+    let label = channel_mask_label(mask, available);
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(label)
+        .width(170.0)
+        .show_ui(ui, |ui| {
+            let effective_max = max_selected.min(available);
+            let hint = if effective_max >= available {
+                if available == 1 {
+                    "Select the only device channel".to_string()
+                } else {
+                    format!("Select up to {available} device channels")
+                }
+            } else {
+                format!("Select up to {effective_max} of {available} device channels")
+            };
+            ui.label(egui::RichText::new(hint).weak());
+            egui::ScrollArea::vertical()
+                .max_height(220.0)
+                .show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        let count = mask.count_ones();
+                        for channel in 0..available.min(64) {
+                            let bit = 1u64 << channel;
+                            let mut selected = mask & bit != 0;
+                            let can_toggle = if selected {
+                                count > 1
+                            } else {
+                                count < max_selected
+                            };
+                            let response = ui.add_enabled(
+                                can_toggle,
+                                egui::Checkbox::new(&mut selected, format!("{}", channel + 1)),
+                            );
+                            if response.changed() {
+                                if selected {
+                                    mask |= bit;
+                                } else {
+                                    mask &= !bit;
+                                }
+                                changed = true;
+                            }
+                        }
+                    });
+                });
+        });
+    if changed {
+        if mask == 0 {
+            mask = 1;
+        }
+        selection.channel_mask = mask & limit;
+        selection.channels = selection.channel_mask.count_ones().max(1);
+    }
+    changed
 }
 
 fn automatic_api_label(api: AudioApi) -> &'static str {
@@ -4109,6 +5011,37 @@ fn automatic_api_label(api: AudioApi) -> &'static str {
 
 fn device_channels(device: &DeviceInfo, input: bool) -> u32 {
     if input { device.inputs } else { device.outputs }
+}
+
+fn apply_automatic_apis_to(devices: &DeviceCache, settings: &mut ProjectSettings) -> bool {
+    let mut changed = false;
+    let input_api = automatic_api(
+        &devices.inputs,
+        &settings.input.name,
+        settings.input.api,
+        true,
+    );
+    changed |= set_selection_api(&devices.inputs, &mut settings.input, input_api, true);
+    let output_api = automatic_api(
+        &devices.outputs,
+        &settings.output.name,
+        settings.output.api,
+        false,
+    );
+    changed |= set_selection_api(&devices.outputs, &mut settings.output, output_api, false);
+    let sidechain_api = automatic_api(
+        &devices.inputs,
+        &settings.sidechain_input.name,
+        settings.sidechain_input.api,
+        true,
+    );
+    changed |= set_selection_api(
+        &devices.inputs,
+        &mut settings.sidechain_input,
+        sidechain_api,
+        true,
+    );
+    changed
 }
 
 fn automatic_api(devices: &[DeviceInfo], name: &str, current: AudioApi, input: bool) -> AudioApi {
@@ -4156,8 +5089,71 @@ fn set_selection_api(
         device.api == api && device.name == selection.name && device_channels(device, input) > 0
     }) {
         selection.id = device.id.clone();
+        let available = device_channels(device, input);
+        let max = if input { 8 } else { 2 };
+        if selection.channel_mask == 0 {
+            selection.channels = selection.channels.clamp(1, available.min(max).max(1));
+        } else {
+            let mask = retain_mask_bits(selection.channel_mask & channel_limit(available), max);
+            selection.channel_mask = mask;
+            if mask == 0 {
+                selection.channels = selection.channels.clamp(1, available.min(max).max(1));
+            } else {
+                selection.channels = mask.count_ones();
+            }
+        }
     }
     true
+}
+
+/// Keeps the lowest selected mask bits when a selection exceeds the channel
+/// cap for its direction, so a preserved mask always fits the new device.
+fn retain_mask_bits(mask: u64, max: u32) -> u64 {
+    let mut mask = mask;
+    while max < 64 && mask.count_ones() > max {
+        let highest = 63 - mask.leading_zeros();
+        mask &= !(1u64 << highest);
+    }
+    mask
+}
+
+/// Switches a draft selection to another API. The same-named device is kept
+/// (with a fitting channel mask) when the new API exposes it; otherwise the
+/// first device of that API replaces it. An API with no devices is rejected
+/// without mutating the draft.
+fn switch_selection_api(
+    devices: &[DeviceInfo],
+    selection: &mut DeviceSelection,
+    api: AudioApi,
+    input: bool,
+) -> bool {
+    let available = devices
+        .iter()
+        .any(|device| device.api == api && device_channels(device, input) > 0);
+    if !available || !set_selection_api(devices, selection, api, input) {
+        return false;
+    }
+    let same_device = devices.iter().any(|device| {
+        device.api == api && device.name == selection.name && device_channels(device, input) > 0
+    });
+    if !same_device
+        && let Some(device) = devices
+            .iter()
+            .find(|device| device.api == api && device_channels(device, input) > 0)
+    {
+        *selection = selection_for(device, device_channels(device, input).min(2));
+    }
+    true
+}
+
+fn available_apis(devices: &[DeviceInfo], input: bool) -> Vec<AudioApi> {
+    let mut apis = Vec::new();
+    for device in devices {
+        if device_channels(device, input) > 0 && !apis.contains(&device.api) {
+            apis.push(device.api);
+        }
+    }
+    apis
 }
 
 fn unique_device_names(devices: &[DeviceInfo], input: bool) -> Vec<String> {
@@ -4368,14 +5364,15 @@ fn move_chain_entry(chain: &mut Vec<ChainEntry>, from: usize, to: usize) -> bool
 #[cfg(test)]
 mod tests {
     use super::{
-        PickerGrouping, build_picker_cache, builtin_descriptor, builtin_spec, descriptor_score,
-        display_category, find_loopback_input, fuzzy_score, move_chain_entry, normalize_search,
-        strip_builtins,
+        DeviceDraft, PickerGrouping, build_picker_cache, builtin_descriptor, builtin_spec,
+        channel_limit, channel_mask_label, default_channel_mask, descriptor_score,
+        display_category, find_loopback_input, fuzzy_score, hidden_repaint_now, move_chain_entry,
+        normalize_search, normalize_selection_channels, strip_builtins, switch_selection_api,
     };
     use michost_builtin::BuiltinKind;
     use michost_graph::{ChainEntry, PluginSpec};
     use michost_host_abi::{AudioApi, DeviceInfo, PluginDescriptor};
-    use michost_project::Project;
+    use michost_project::{DeviceSelection, Project, ProjectSettings};
 
     fn entry(id: u64) -> ChainEntry {
         ChainEntry {
@@ -4398,6 +5395,160 @@ mod tests {
             inputs: channels,
             ..DeviceInfo::default()
         }
+    }
+
+    #[test]
+    fn channel_masks_default_to_the_first_channels() {
+        let selection = DeviceSelection {
+            channels: 2,
+            ..DeviceSelection::default()
+        };
+        assert_eq!(default_channel_mask(&selection, 8), 0b11);
+        let explicit = DeviceSelection {
+            channels: 2,
+            channel_mask: 0b1001,
+            ..DeviceSelection::default()
+        };
+        assert_eq!(default_channel_mask(&explicit, 8), 0b1001);
+        assert_eq!(channel_limit(64), u64::MAX);
+        assert_eq!(channel_limit(0), 0);
+    }
+
+    #[test]
+    fn channel_mask_labels_group_ranges() {
+        assert_eq!(channel_mask_label(0b1011, 8), "Ch 1-2, 4");
+        assert_eq!(channel_mask_label(0b10000, 8), "Ch 5");
+        assert_eq!(channel_mask_label(0, 8), "Ch 1");
+    }
+
+    #[test]
+    fn normalizes_stale_channel_masks() {
+        let mut selection = DeviceSelection {
+            channels: 3,
+            channel_mask: 0b111,
+            ..DeviceSelection::default()
+        };
+        normalize_selection_channels(&mut selection, 2, 2);
+        assert_eq!(selection.channel_mask, 0);
+        assert_eq!(selection.channels, 2);
+
+        let mut valid = DeviceSelection {
+            channels: 2,
+            channel_mask: 0b1010,
+            ..DeviceSelection::default()
+        };
+        normalize_selection_channels(&mut valid, 8, 2);
+        assert_eq!(valid.channel_mask, 0b1010);
+        assert_eq!(valid.channels, 2);
+
+        let mut beyond = DeviceSelection {
+            channels: 2,
+            channel_mask: 0b1_0000_0001,
+            ..DeviceSelection::default()
+        };
+        normalize_selection_channels(&mut beyond, 8, 2);
+        assert_eq!(beyond.channel_mask, 0);
+    }
+
+    #[test]
+    fn api_switch_preserves_a_fitting_channel_mask() {
+        let devices = [
+            input_device("Mic", AudioApi::Asio, 4),
+            input_device("Mic", AudioApi::WasapiShared, 4),
+        ];
+        let mut selection = DeviceSelection {
+            api: AudioApi::Asio,
+            name: "Mic".to_string(),
+            channels: 3,
+            channel_mask: 0b1011,
+            ..DeviceSelection::default()
+        };
+        assert!(switch_selection_api(
+            &devices,
+            &mut selection,
+            AudioApi::WasapiShared,
+            true,
+        ));
+        assert_eq!(selection.api, AudioApi::WasapiShared);
+        assert_eq!(selection.channels, 3);
+        assert_eq!(selection.channel_mask, 0b1011);
+    }
+
+    #[test]
+    fn api_switch_clamps_mask_to_device_and_direction_cap() {
+        let inputs = [
+            input_device("Mic", AudioApi::Asio, 8),
+            input_device("Mic", AudioApi::WasapiShared, 2),
+        ];
+        let mut selection = DeviceSelection {
+            api: AudioApi::Asio,
+            name: "Mic".to_string(),
+            channels: 2,
+            channel_mask: 0b1010,
+            ..DeviceSelection::default()
+        };
+        switch_selection_api(&inputs, &mut selection, AudioApi::WasapiShared, true);
+        assert_eq!(selection.channel_mask, 0b10);
+        assert_eq!(selection.channels, 1);
+
+        let outputs = [
+            DeviceInfo {
+                name: "Out".to_string(),
+                api: AudioApi::Asio,
+                outputs: 8,
+                ..DeviceInfo::default()
+            },
+            DeviceInfo {
+                name: "Out".to_string(),
+                api: AudioApi::WasapiShared,
+                outputs: 8,
+                ..DeviceInfo::default()
+            },
+        ];
+        let mut selection = DeviceSelection {
+            api: AudioApi::Asio,
+            name: "Out".to_string(),
+            channels: 4,
+            channel_mask: 0b1111,
+            ..DeviceSelection::default()
+        };
+        switch_selection_api(&outputs, &mut selection, AudioApi::WasapiShared, false);
+        assert_eq!(selection.channel_mask, 0b11);
+        assert_eq!(selection.channels, 2);
+    }
+
+    #[test]
+    fn api_switch_rejects_an_api_without_devices() {
+        let devices = [input_device("Mic", AudioApi::WasapiShared, 2)];
+        let mut selection = DeviceSelection {
+            api: AudioApi::WasapiShared,
+            name: "Mic".to_string(),
+            channels: 2,
+            ..DeviceSelection::default()
+        };
+        assert!(!switch_selection_api(
+            &devices,
+            &mut selection,
+            AudioApi::Asio,
+            true,
+        ));
+        assert_eq!(selection.api, AudioApi::WasapiShared);
+    }
+
+    #[test]
+    fn device_draft_round_trips_device_selections() {
+        let mut settings = ProjectSettings::default();
+        settings.input.channels = 2;
+        settings.output.channels = 2;
+        settings.sidechain_input_enabled = true;
+        let draft = DeviceDraft::from_settings(&settings);
+        assert!(draft.matches(&settings));
+        let mut changed = settings.clone();
+        changed.input.channel_mask = 0b1000;
+        changed.input.channels = 1;
+        assert!(!draft.matches(&changed));
+        draft.apply_to(&mut changed);
+        assert!(draft.matches(&changed));
     }
 
     #[test]
@@ -4531,6 +5682,14 @@ mod tests {
             "Instrument / Synth"
         );
         assert_eq!(display_category(""), "");
+    }
+
+    #[test]
+    fn hidden_window_repaints_immediately_then_polls() {
+        assert!(hidden_repaint_now(0));
+        assert!(hidden_repaint_now(1));
+        assert!(!hidden_repaint_now(2));
+        assert!(!hidden_repaint_now(u8::MAX));
     }
 
     #[test]

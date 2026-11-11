@@ -78,7 +78,7 @@ fn pan_gains(pan: f32) -> (f32, f32) {
 }
 
 pub struct Dsp {
-    gain_db: OnePole,
+    gain: OnePole,
     pan: OnePole,
     phase: OnePole,
     primed: bool,
@@ -87,7 +87,7 @@ pub struct Dsp {
 impl Dsp {
     pub fn new(sample_rate: f64) -> Self {
         let mut dsp = Self {
-            gain_db: OnePole::from_time(SMOOTHING_MS, sample_rate),
+            gain: OnePole::from_time(SMOOTHING_MS, sample_rate),
             pan: OnePole::from_time(SMOOTHING_MS, sample_rate),
             phase: OnePole::from_time(SMOOTHING_MS, sample_rate),
             primed: false,
@@ -97,7 +97,7 @@ impl Dsp {
     }
 
     fn snap_to_defaults(&mut self) {
-        self.gain_db.set_value(0.0);
+        self.gain.set_value(1.0);
         self.pan.set_value(0.0);
         self.phase.set_value(1.0);
     }
@@ -105,19 +105,19 @@ impl Dsp {
 
 impl BuiltinDsp for Dsp {
     fn process(&mut self, left: &mut [f32], right: &mut [f32], params: &ParamSet) {
-        let gain_db = params.get(0);
+        let gain_target = db_to_gain(params.get(0));
         let pan = params.get(1) * 0.01;
         let phase_target = if params.get(2) >= 0.5 { -1.0 } else { 1.0 };
 
         if !self.primed {
-            self.gain_db.set_value(gain_db);
+            self.gain.set_value(gain_target);
             self.pan.set_value(pan);
             self.phase.set_value(phase_target);
             self.primed = true;
         }
 
         for (l, r) in left.iter_mut().zip(right.iter_mut()) {
-            let gain = db_to_gain(self.gain_db.process(gain_db));
+            let gain = self.gain.process(gain_target);
             let (pan_l, pan_r) = pan_gains(self.pan.process(pan));
             let phase = self.phase.process(phase_target);
 
@@ -127,7 +127,7 @@ impl BuiltinDsp for Dsp {
     }
 
     fn reset(&mut self) {
-        self.gain_db.reset();
+        self.gain.reset();
         self.pan.reset();
         self.phase.reset();
         self.snap_to_defaults();

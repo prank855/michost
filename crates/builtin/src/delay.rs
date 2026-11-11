@@ -7,7 +7,7 @@
 
 use std::f64::consts::PI;
 
-use crate::dsp_util::{OnePole, smoothing_coefficient};
+use crate::dsp_util::{OnePole, circular_read, smoothing_coefficient};
 use crate::{BuiltinDsp, ParamCurve, ParamSet, ParamSpec, ParamStyle};
 
 pub static SPECS: &[ParamSpec] = &[
@@ -101,11 +101,7 @@ fn tone_coefficient(tone_hz: f32, sample_rate: f64) -> f32 {
     (1.0 - (-2.0 * PI * cutoff / sample_rate).exp()) as f32
 }
 
-/// Circular line with a float-safe fractional read.
-///
-/// The shared helper computes its read position in `f32`, where a tiny
-/// negative remainder can round up to the buffer length. This variant uses
-/// `f64` and wraps an out-of-range position back to zero.
+/// Circular line with an allocation-free fractional read.
 struct Line {
     buffer: Vec<f32>,
     write: usize,
@@ -137,21 +133,7 @@ impl Line {
 
     #[inline]
     fn read(&self, delay: f32) -> f32 {
-        let length = self.buffer.len();
-        let max = (length - 2) as f32;
-        let delay = if delay.is_finite() {
-            delay.clamp(1.0, max)
-        } else {
-            1.0
-        };
-        let mut position = (self.write as f64 - f64::from(delay)).rem_euclid(length as f64);
-        if position >= length as f64 {
-            position = 0.0;
-        }
-        let index = (position.floor() as usize).min(length - 1);
-        let fraction = (position - index as f64) as f32;
-        let next = if index + 1 == length { 0 } else { index + 1 };
-        self.buffer[index] + (self.buffer[next] - self.buffer[index]) * fraction
+        circular_read(&self.buffer, self.write, delay)
     }
 
     fn clear(&mut self) {

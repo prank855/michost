@@ -2,6 +2,7 @@
 param(
     [ValidateSet("Debug", "Release")]
     [string]$Configuration = "Release",
+    [string]$Version,
     [string]$JuceDir = $env:MICHOST_JUCE_DIR,
     [string]$AsioDir = $env:ASIO_SDK_DIR,
     [switch]$NoAsio,
@@ -16,6 +17,61 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Resolve-Path (Join-Path $PSScriptRoot "..")
 $profileName = if ($Configuration -eq "Debug") { "debug" } else { "release" }
+$targetDir = Join-Path $root "target\$profileName"
+
+$cargoText = Get-Content -LiteralPath (Join-Path $root "Cargo.toml") -Raw
+$workspaceVersion = "0.0.0"
+if ($cargoText -match '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"') {
+    $workspaceVersion = $Matches[1]
+}
+$baseVersion = $workspaceVersion
+if (-not [string]::IsNullOrWhiteSpace($Version)) {
+    $baseVersion = $Version
+}
+$buildTimeUtc = $env:MICHOST_BUILD_TIME
+if ([string]::IsNullOrWhiteSpace($buildTimeUtc)) {
+    $buildTimeUtc = (Get-Date).ToUniversalTime().ToString("yyyyMMdd'T'HHmmss'Z'")
+}
+$gitHash = $env:MICHOST_GIT_HASH
+if ([string]::IsNullOrWhiteSpace($gitHash)) {
+    $value = (& git -C $root rev-parse --short=8 HEAD 2>$null | Select-Object -First 1)
+    if ([string]::IsNullOrWhiteSpace($value)) {
+        $gitHash = "nogit"
+    } else {
+        $gitHash = "$value".Trim()
+    }
+}
+$gitDirty = $false
+if (-not [string]::IsNullOrWhiteSpace($env:MICHOST_GIT_DIRTY)) {
+    $gitDirty = $env:MICHOST_GIT_DIRTY -eq "1"
+} else {
+    $status = (& git -C $root status --porcelain 2>$null | Out-String).Trim()
+    $gitDirty = $status.Length -gt 0
+}
+$dirtySuffix = ""
+if ($gitDirty) { $dirtySuffix = ".dirty" }
+$env:MICHOST_BUILD_TIME = $buildTimeUtc
+$env:MICHOST_GIT_HASH = $gitHash
+$env:MICHOST_GIT_DIRTY = if ($gitDirty) { "1" } else { "0" }
+if ([string]::IsNullOrWhiteSpace($env:MICHOST_BUILD_VERSION)) {
+    $env:MICHOST_BUILD_VERSION = "${baseVersion}+${buildTimeUtc}.${gitHash}${dirtySuffix}"
+}
+$buildVersion = $env:MICHOST_BUILD_VERSION
+
+function Write-BuildStamp {
+    New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
+    $stamp = [ordered]@{
+        version = $baseVersion
+        build_version = $buildVersion
+        build_time = $buildTimeUtc
+        git_hash = $gitHash
+        git_dirty = $gitDirty
+    }
+    $stampPath = Join-Path $targetDir "build-stamp.json"
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText($stampPath, ($stamp | ConvertTo-Json), $utf8NoBom)
+    Write-Host "Build stamp: $stampPath"
+}
 
 function Test-WdkInstalled {
     $roots = New-Object System.Collections.Generic.List[string]
@@ -68,7 +124,6 @@ if (-not $SkipNative) {
     }
 
     $cmake = Find-CMake
-    $targetDir = Join-Path $root "target\$profileName"
     New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
     $buildDir = Join-Path $root ("target\cpp-" + $profileName)
 
@@ -135,3 +190,5 @@ if ($runDriver) {
         }
     }
 }
+
+Write-BuildStamp
