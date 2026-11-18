@@ -1,6 +1,7 @@
 #include "host_internal.h"
 
 #include <cmath>
+#include <cstdio>
 
 using namespace michost;
 
@@ -8,6 +9,18 @@ namespace {
 
 std::mutex streamRegistryMutex;
 std::map<void*, DeviceStream*> streamRegistry;
+
+// JUCE device types keep mutable scan state (names, ids, capabilities), so all
+// enumeration and name-based device creation must be serialized even though
+// callers run on different worker threads. Audio callbacks never take this.
+std::mutex deviceEnumerationMutex;
+
+thread_local std::string gLastStreamError;
+
+void setLastStreamError(const juce::String& message)
+{
+    gLastStreamError = message.toStdString();
+}
 
 int32_t apiForType(const juce::String& typeName)
 {
@@ -105,6 +118,7 @@ DeviceCapabilityInfo queryCapabilities(Host& host,
 int32_t enumerateDevices(Host& host, int32_t kind, MHDeviceInfo* out, int32_t max, int32_t* count)
 {
     prepareCom();
+    const std::lock_guard<std::mutex> enumerationLock(deviceEnumerationMutex);
     if (count == nullptr || max < 0 || (max > 0 && out == nullptr))
         return MH_INVALID_ARGUMENT;
     *count = 0;
@@ -337,20 +351,28 @@ void DeviceStream::report(int32_t status, const juce::String& message)
     reportError(host, status, message);
 }
 
+void DeviceStream::reportLocal(int32_t status, const juce::String& message)
+{
+    setLastStreamError(message);
+    if (callbacks.on_error != nullptr)
+        callbacks.on_error(callbacks.ctx, status, message.toRawUTF8());
+}
+
 int32_t DeviceStream::open()
 {
     prepareCom();
 
     const auto name = deviceName();
     if (name.isEmpty() || config.channels == 0) {
-        report(MH_INVALID_ARGUMENT, "the stream configuration needs a device name and at least one channel");
+        reportLocal(MH_INVALID_ARGUMENT, "the stream configuration needs a device name and at least one channel");
         return MH_INVALID_ARGUMENT;
     }
     if (config.api < MH_API_WASAPI_SHARED || config.api > MH_API_ASIO) {
-        report(MH_INVALID_ARGUMENT, "the stream configuration has an unknown API");
+        reportLocal(MH_INVALID_ARGUMENT, "the stream configuration has an unknown API");
         return MH_INVALID_ARGUMENT;
     }
 
+    std::unique_lock<std::mutex> enumerationLock(deviceEnumerationMutex);
     juce::AudioIODeviceType* chosen = nullptr;
     for (auto* type : host.devices.getAvailableDeviceTypes()) {
         if (type == nullptr)
@@ -362,17 +384,28 @@ int32_t DeviceStream::open()
         }
     }
     if (chosen == nullptr) {
-        report(MH_NOT_FOUND, "the requested audio API is not available");
+        reportLocal(MH_NOT_FOUND, "the requested audio API is not available");
         return MH_NOT_FOUND;
     }
 
     if (config.api == MH_API_ASIO) {
         const auto status = host.reserveAsio(name);
         if (status != MH_OK) {
-            report(status, "could not reserve the ASIO driver");
+            reportLocal(status, "could not reserve the ASIO driver");
             return status;
         }
         asioReserved = true;
+    }
+
+    const auto needsInput = wantsInput();
+    const auto needsOutput = !wantsInput() || config.output_channels > 0;
+    const auto inputNames = needsInput ? chosen->getDeviceNames(true) : juce::StringArray();
+    const auto outputNames = needsOutput ? chosen->getDeviceNames(false) : juce::StringArray();
+    if ((needsInput && !inputNames.contains(name)) || (needsOutput && !outputNames.contains(name))) {
+        reportLocal(MH_DEVICE_MISSING,
+                    "'" + name + "' is not in the current device list; it may have been renamed or removed");
+        close();
+        return MH_DEVICE_MISSING;
     }
 
     const bool duplex = wantsInput() && config.output_channels > 0;
@@ -386,10 +419,12 @@ int32_t DeviceStream::open()
     if (device == nullptr)
         device.reset(deviceType->createDevice(name, name));
     if (device == nullptr) {
-        report(MH_NOT_FOUND, "could not create the device '" + name + "'");
+        reportLocal(MH_ERR, "'" + name + "' exists but the audio backend could not initialise it"
+                                " (it may be in use or in an unsupported format)");
         close();
-        return MH_NOT_FOUND;
+        return MH_ERR;
     }
+    enumerationLock.unlock();
 
     const auto buildMask = [&](uint32_t count,
                                uint64_t bits,
@@ -397,9 +432,9 @@ int32_t DeviceStream::open()
                                const char* label,
                                juce::BigInteger& mask) -> bool {
         if (available > 0 && static_cast<int>(count) > available) {
-            report(MH_ERR, "'" + name + "' offers " + juce::String(available) + " "
-                               + label + " channels, but " + juce::String(count)
-                               + " were requested");
+            reportLocal(MH_ERR, "'" + name + "' offers " + juce::String(available) + " "
+                                    + label + " channels, but " + juce::String(count)
+                                    + " were requested");
             return false;
         }
         if (bits != 0) {
@@ -407,15 +442,15 @@ int32_t DeviceStream::open()
                 if ((bits >> bit) & 1ull)
                     mask.setBit(bit);
             if (mask.countNumberOfSetBits() != static_cast<int>(count)) {
-                report(MH_ERR, juce::String("the ") + label + " channel mask selects "
-                                   + juce::String(mask.countNumberOfSetBits())
-                                   + " channels, but " + juce::String(count)
-                                   + " were requested");
+                reportLocal(MH_ERR, juce::String("the ") + label + " channel mask selects "
+                                        + juce::String(mask.countNumberOfSetBits())
+                                        + " channels, but " + juce::String(count)
+                                        + " were requested");
                 return false;
             }
             if (available > 0 && mask.getHighestBit() >= available) {
-                report(MH_ERR, "'" + name + "' offers only " + juce::String(available)
-                                   + " " + label + " channels for the selected mask");
+                reportLocal(MH_ERR, "'" + name + "' offers only " + juce::String(available)
+                                        + " " + label + " channels for the selected mask");
                 return false;
             }
         } else {
@@ -455,7 +490,7 @@ int32_t DeviceStream::open()
     auto error = device->open(inputMask, outputMask, requestedRate, requestedBlock);
 
     if (error.isNotEmpty()) {
-        report(MH_ERR, "opening '" + name + "': " + error);
+        reportLocal(MH_ERR, "opening '" + name + "': " + error);
         close();
         return MH_ERR;
     }
@@ -466,7 +501,7 @@ int32_t DeviceStream::open()
 int32_t DeviceStream::start()
 {
     if (device == nullptr) {
-        report(MH_ERR, "the stream is not open");
+        reportLocal(MH_ERR, "the stream is not open");
         return MH_ERR;
     }
     if (!running.exchange(true))
@@ -688,6 +723,16 @@ int32_t mh_stream_control_panel(void* stream_handle)
     } catch (...) {
         return MH_ERR;
     }
+}
+
+int32_t mh_take_error(char* out, int32_t cap)
+{
+    if (out == nullptr || cap <= 0)
+        return MH_INVALID_ARGUMENT;
+    std::snprintf(out, static_cast<size_t>(cap), "%s", gLastStreamError.c_str());
+    out[cap - 1] = '\0';
+    gLastStreamError.clear();
+    return MH_OK;
 }
 
 }

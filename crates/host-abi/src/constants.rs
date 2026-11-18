@@ -15,6 +15,7 @@ pub const MH_INVALID_ARGUMENT: i32 = 3;
 pub const MH_ABI_MISMATCH: i32 = 4;
 pub const MH_TIMEOUT: i32 = 5;
 pub const MH_NOT_FOUND: i32 = 6;
+pub const MH_DEVICE_MISSING: i32 = 7;
 
 pub const MH_STREAM_INPUT: i32 = 0;
 pub const MH_STREAM_OUTPUT: i32 = 1;

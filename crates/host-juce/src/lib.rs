@@ -12,8 +12,8 @@ use michost_host_abi::{
     ABI_VERSION, BackendError, BackendResult, DeviceInfo, DeviceKind, DeviceLatency, DeviceStream,
     HostBackend, MH_ABI_MISMATCH, MH_INVALID_ARGUMENT, MH_LAYOUT_CALLBACKS, MH_LAYOUT_DEVICE_INFO,
     MH_LAYOUT_LATENCY, MH_LAYOUT_PARAM_INFO, MH_LAYOUT_PLUGIN_DESCRIPTOR,
-    MH_LAYOUT_STREAM_CALLBACKS, MH_LAYOUT_STREAM_CONFIG, MH_NOT_FOUND, MH_OK, MhCallbacks,
-    MhDeviceChangedCallback, MhDeviceInfo, MhLatency, MhParamInfo, MhPluginDescriptor,
+    MH_LAYOUT_STREAM_CALLBACKS, MH_LAYOUT_STREAM_CONFIG, MH_MESSAGE_LEN, MH_NOT_FOUND, MH_OK,
+    MhCallbacks, MhDeviceChangedCallback, MhDeviceInfo, MhLatency, MhParamInfo, MhPluginDescriptor,
     MhScanProgress, MhStreamCallbacks, MhStreamConfig, MhStreamErrorCallback,
     MhStreamInputCallback, MhStreamOutputCallback, ParamInfo, PluginChannels, PluginDescriptor,
     PluginHandle, PluginHost, StateKind, StreamCallbacks, StreamConfig, StreamHost, UiEvent,
@@ -36,6 +36,7 @@ type FnSetDeviceChangeCallback = unsafe extern "C" fn(
     callback: Option<MhDeviceChangedCallback>,
     ctx: *mut c_void,
 ) -> i32;
+type FnTakeError = unsafe extern "C" fn(*mut c_char, i32) -> i32;
 type FnDeviceEnumerate = unsafe extern "C" fn(
     manager: *mut c_void,
     kind: i32,
@@ -143,6 +144,7 @@ struct MhApi {
     init: FnInit,
     set_callbacks: FnSetCallbacks,
     set_device_change_callback: Option<FnSetDeviceChangeCallback>,
+    take_error: Option<FnTakeError>,
     shutdown: FnShutdown,
     device_enumerate: FnDeviceEnumerate,
     stream_open: FnStreamOpen,
@@ -184,6 +186,12 @@ impl MhApi {
             set_device_change_callback: unsafe {
                 library
                     .get::<FnSetDeviceChangeCallback>(b"mh_set_device_change_callback\0")
+                    .ok()
+                    .map(|symbol| *symbol)
+            },
+            take_error: unsafe {
+                library
+                    .get::<FnTakeError>(b"mh_take_error\0")
                     .ok()
                     .map(|symbol| *symbol)
             },
@@ -439,6 +447,24 @@ impl JuceBackend {
         Ok(unsafe { (self.api.abi_version)() })
     }
 
+    pub fn take_error(&self) -> Option<String> {
+        let take_error = self.api.take_error?;
+        let mut buffer = [0u8; MH_MESSAGE_LEN];
+        let status =
+            unsafe { take_error(buffer.as_mut_ptr().cast::<c_char>(), buffer.len() as i32) };
+        if status != MH_OK {
+            return None;
+        }
+        let len = buffer
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(buffer.len());
+        if len == 0 {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&buffer[..len]).into_owned())
+    }
+
     pub fn param_count(&self, handle: PluginHandle) -> BackendResult<u32> {
         let mut count = 0i32;
         let status = unsafe { (self.api.plugin_param_count)(handle.as_ptr(), &mut count) };
@@ -625,11 +651,19 @@ impl StreamHost for JuceBackend {
                 .map(|_| stream_error_trampoline as MhStreamErrorCallback),
         };
 
+        let _ = self.take_error();
+
         let mut handle: *mut c_void = null_mut();
         let status = unsafe {
             (self.api.stream_open)(self.manager.get(), &ffi_config, &ffi_callbacks, &mut handle)
         };
         if status != MH_OK {
+            if let Some(message) = self.take_error() {
+                return Err(BackendError::new(
+                    status,
+                    format!("mh_stream_open failed: {message}"),
+                ));
+            }
             return Err(self.backend_error(status, "mh_stream_open"));
         }
         if handle.is_null() {

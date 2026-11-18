@@ -9,14 +9,14 @@ use michost_graph::{
     PluginProcessor, PluginSpec, SidechainSource, samples_to_milliseconds,
 };
 use michost_host_abi::{
-    AudioApi, BackendProcessor, DeviceLatency, DeviceStream, PluginHandle, PluginHost, StateKind,
-    StreamConfig, StreamDirection, StreamHost,
+    AudioApi, BackendProcessor, DeviceLatency, DeviceStream, MH_ERR, PluginHandle, PluginHost,
+    StateKind, StreamConfig, StreamDirection, StreamHost,
 };
 use michost_host_juce::JuceBackend;
 use michost_project::{DeviceSelection, OutputKind, Project};
 use michost_vmic::{Format as VmicFormat, VirtualMicSink};
 
-use crate::bridge::{self, StreamBridge};
+use crate::bridge::{self, MonitorError, PreparedMonitor, StreamBridge};
 use crate::logging;
 
 const MIN_SAMPLE_RATE: f64 = 8_000.0;
@@ -733,7 +733,10 @@ impl AudioSession {
                 monitor.channel_mask,
             )
         {
-            logging::line(format!("monitor: warm open failed: {error}"));
+            logging::line(format!(
+                "monitor: warm open failed ({}): {}",
+                error.status, error.message
+            ));
         }
         let latency = session.latency_breakdown();
         logging::line(format!(
@@ -1201,10 +1204,10 @@ impl AudioSession {
         api: AudioApi,
         channels: u32,
         channel_mask: u64,
-    ) -> Result<(), String> {
+    ) -> Result<(), MonitorError> {
         self.bridge
             .as_mut()
-            .ok_or_else(|| "audio is not running".to_string())?
+            .ok_or_else(|| MonitorError::new(MH_ERR, "audio is not running"))?
             .warm_monitor(device, api, channels, channel_mask)
     }
 
@@ -1214,10 +1217,10 @@ impl AudioSession {
         api: AudioApi,
         channels: u32,
         channel_mask: u64,
-    ) -> Result<(), String> {
+    ) -> Result<(), MonitorError> {
         self.bridge
             .as_mut()
-            .ok_or_else(|| "audio is not running".to_string())?
+            .ok_or_else(|| MonitorError::new(MH_ERR, "audio is not running"))?
             .start_monitor(device, api, channels, channel_mask)
     }
 
@@ -1237,6 +1240,37 @@ impl AudioSession {
         self.bridge
             .as_ref()
             .is_some_and(|bridge| bridge.monitor_is_duplex())
+    }
+
+    pub fn monitor_is_active(&self) -> bool {
+        self.bridge
+            .as_ref()
+            .is_some_and(StreamBridge::monitor_is_active)
+    }
+
+    pub fn monitor_is_active_on(&self, device: &str, api: AudioApi) -> bool {
+        self.monitor_is_active()
+            && self
+                .bridge
+                .as_ref()
+                .is_some_and(|bridge| bridge.monitor_is_active_on(device, api))
+    }
+
+    pub fn monitor_is_open_on(&self, device: &str, api: AudioApi) -> bool {
+        self.bridge
+            .as_ref()
+            .is_some_and(|bridge| bridge.monitor_is_open_on(device, api))
+    }
+
+    /// Installs and enables a monitor opened on a worker.
+    pub fn install_prepared_monitor(
+        &mut self,
+        prepared: PreparedMonitor,
+    ) -> Result<(), MonitorError> {
+        self.bridge
+            .as_mut()
+            .ok_or_else(|| MonitorError::new(MH_ERR, "audio is not running"))?
+            .install_prepared_monitor_and_enable(prepared)
     }
 
     pub fn set_monitor_trim(&mut self, db: f32) {

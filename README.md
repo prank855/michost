@@ -97,6 +97,7 @@ Open **Scan VST3** to find installed VST3 plugins. Scanning uses plugin metadata
 ## Troubleshooting
 
 - **No audio**: confirm the input and output devices, the selected API, and that the window shows **Running**. Check that the output is not muted. For ASIO, close other apps that may be using the driver.
+- **A device was renamed or replugged**: MicHost re-enumerates at startup and re-binds a selection to the single device with the same model name (for example `Main (MOTU M Series)` to `Headphone (MOTU M Series)`). If the match is ambiguous, select the device and press **Apply**. A monitor output that fails to open stays enabled and retries with backoff. **Rescan** in the footer is for stale capability data (for example ASIO channel counts) and stops audio first.
 - **A plugin is missing**: run **Scan VST3**, check **Folders**, and confirm the plugin is a 64-bit VST3. Rescan after installing new plugins.
 - **High latency**: try ASIO or WASAPI low-latency/exclusive, lower the buffers, and use **Measure**. Virtual cables and the receiving app add latency outside MicHost.
 - **Howling or feedback**: use headphones or a virtual cable instead of speakers.

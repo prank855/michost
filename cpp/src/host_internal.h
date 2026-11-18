@@ -167,6 +167,7 @@ public:
 
 private:
     void report(int32_t status, const juce::String& message);
+    void reportLocal(int32_t status, const juce::String& message);
 
     Host& host;
     MHStreamConfig config{};

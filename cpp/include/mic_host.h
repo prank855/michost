@@ -44,7 +44,8 @@ enum {
     MH_INVALID_ARGUMENT = 3,
     MH_ABI_MISMATCH = 4,
     MH_TIMEOUT = 5,
-    MH_NOT_FOUND = 6
+    MH_NOT_FOUND = 6,
+    MH_DEVICE_MISSING = 7
 };
 
 enum {
@@ -178,6 +179,9 @@ MH_API int32_t mh_stream_stop(void* stream);
 MH_API int32_t mh_stream_close(void* stream);
 MH_API int32_t mh_stream_latency(void* stream, MHLatency* out);
 MH_API int32_t mh_stream_control_panel(void* stream);
+
+// Returns and clears the last synchronous stream message for the calling thread.
+MH_API int32_t mh_take_error(char* out, int32_t cap);
 
 MH_API int32_t mh_scan(void* manager,
                        MHScanProgress progress,

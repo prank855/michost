@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 use michost_graph::{ChainEngine, MAX_FRAMES, drift_correction};
 
 use michost_host_abi::{
-    AudioApi, DeviceStream, StreamCallbacks, StreamConfig, StreamDirection, StreamHost,
+    AudioApi, DeviceStream, MH_ERR, MH_INVALID_ARGUMENT, StreamCallbacks, StreamConfig,
+    StreamDirection, StreamHost,
 };
 use michost_host_juce::JuceBackend;
 use michost_vmic::VirtualMicSink;
@@ -23,6 +24,120 @@ pub const MAX_OUTPUT_CHANNELS: usize = 2;
 const RESAMPLE_MAX: usize = MAX_FRAMES * 10;
 const ENGINE_DRIFT: f64 = 0.005;
 const VMIC_PUMP_INTERVAL: Duration = Duration::from_millis(1);
+
+/// A monitor open failure that keeps the native status so the UI can tell a
+/// missing endpoint from any other error instead of matching on text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MonitorError {
+    pub status: i32,
+    pub message: String,
+}
+
+impl MonitorError {
+    pub fn new(status: i32, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for MonitorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "monitor error {}: {}", self.status, self.message)
+    }
+}
+
+/// An opened, uninstalled monitor output. The device is already configured and
+/// the sink exists; `install_prepared_monitor` wires it into the bridge. Opening
+/// happens on the caller's thread, so the app can do it on a worker.
+pub struct PreparedMonitor {
+    stream: DeviceStream,
+    context: Box<OutputContext>,
+    underruns: Arc<AtomicU64>,
+    rate: f64,
+    target: usize,
+    capacity: usize,
+    producers: Vec<rtrb::Producer<f32>>,
+    device: String,
+    api: AudioApi,
+}
+
+/// Opens and configures a monitor output without touching the bridge or the
+/// audio thread. Never starts the stream; installation does that.
+pub fn prepare_monitor(
+    host: &JuceBackend,
+    device: &str,
+    api: AudioApi,
+    channels: u32,
+    channel_mask: u64,
+) -> Result<PreparedMonitor, MonitorError> {
+    if device.trim().is_empty() {
+        return Err(MonitorError::new(
+            MH_INVALID_ARGUMENT,
+            "no monitor device is available",
+        ));
+    }
+    let channels = channels.clamp(1, MAX_OUTPUT_CHANNELS as u32);
+    let mut sink = output_sink(channels as usize, MONITOR_CAPACITY)
+        .map_err(|error| MonitorError::new(MH_ERR, error))?;
+    let callbacks = output_callbacks(&mut sink);
+    let OutputSink {
+        context,
+        producers,
+        capacity,
+    } = sink;
+    let config = StreamConfig {
+        device: device.to_string(),
+        sample_rate: 0.0,
+        block_size: 0,
+        channels,
+        api,
+        direction: StreamDirection::Output,
+        channel_mask,
+        output_channels: 0,
+        output_channel_mask: 0,
+    };
+    let stream = match host.open_stream(&config, callbacks) {
+        Ok(stream) => stream,
+        Err(error) => return Err(MonitorError::new(error.status, error.message)),
+    };
+    let latency = match host.stream_latency(&stream) {
+        Ok(latency) => latency,
+        Err(error) => {
+            host.close_stream(stream);
+            return Err(MonitorError::new(error.status, error.message));
+        }
+    };
+    if latency.sample_rate == 0 {
+        host.close_stream(stream);
+        return Err(MonitorError::new(
+            MH_ERR,
+            "the monitor device reported no sample rate",
+        ));
+    }
+    let rate = latency.sample_rate as f64;
+    let target = (latency.buffer as usize)
+        .saturating_mul(2)
+        .clamp(1024, (capacity / 2).max(1024));
+    let underruns = context.underruns.clone();
+    Ok(PreparedMonitor {
+        stream,
+        context,
+        underruns,
+        rate,
+        target,
+        capacity,
+        producers,
+        device: device.to_string(),
+        api,
+    })
+}
+
+/// Closes a prepared monitor that was never installed.
+pub fn discard_prepared_monitor(host: &JuceBackend, prepared: PreparedMonitor) {
+    host.close_stream(prepared.stream);
+}
 
 /// Counters for the virtual microphone pump, surfaced next to the device stats.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -510,6 +625,7 @@ pub struct StreamBridge {
     monitor_stream: Option<DeviceStream>,
     monitor_context: Option<Box<OutputContext>>,
     monitor_underruns: Option<Arc<AtomicU64>>,
+    monitor_device: Option<(String, AudioApi)>,
     monitor_active: bool,
     duplex_monitor: bool,
     monitor_gain: Arc<AtomicU32>,
@@ -840,6 +956,7 @@ impl StreamBridge {
             monitor_stream: None,
             monitor_context: None,
             monitor_underruns: None,
+            monitor_device: None,
             monitor_active: false,
             duplex_monitor,
             monitor_gain,
@@ -925,55 +1042,55 @@ impl StreamBridge {
         api: AudioApi,
         channels: u32,
         channel_mask: u64,
-    ) -> Result<(), String> {
+    ) -> Result<(), MonitorError> {
+        if device.trim().is_empty() {
+            return Err(MonitorError::new(
+                MH_INVALID_ARGUMENT,
+                "no monitor device is available",
+            ));
+        }
         if self.duplex_monitor {
+            self.monitor_device = Some((device.to_string(), api));
             return Ok(());
         }
         if self.monitor_stream.is_some() {
+            let same_device = self
+                .monitor_device
+                .as_ref()
+                .is_some_and(|(opened, opened_api)| opened == device && *opened_api == api);
+            if same_device {
+                return Ok(());
+            }
+            self.close_monitor();
+        }
+        let prepared = prepare_monitor(&self.host, device, api, channels, channel_mask)?;
+        self.install_prepared_monitor(prepared)
+    }
+
+    /// Installs an already-opened monitor output and starts its callback. The
+    /// bridge and monitor queue are only touched here, on the UI thread.
+    pub fn install_prepared_monitor(
+        &mut self,
+        prepared: PreparedMonitor,
+    ) -> Result<(), MonitorError> {
+        if self.duplex_monitor {
+            discard_prepared_monitor(&self.host, prepared);
             return Ok(());
         }
-        if device.trim().is_empty() {
-            return Err("no monitor device is available".to_string());
+        if self.monitor_stream.is_some() {
+            self.close_monitor();
         }
-        let channels = channels.clamp(1, MAX_OUTPUT_CHANNELS as u32);
-        let mut sink = output_sink(channels as usize, MONITOR_CAPACITY)?;
-        let callbacks = output_callbacks(&mut sink);
-        let OutputSink {
+        let PreparedMonitor {
+            stream,
             context,
-            producers,
+            underruns,
+            rate,
+            target,
             capacity,
-        } = sink;
-        let config = StreamConfig {
-            device: device.to_string(),
-            sample_rate: 0.0,
-            block_size: 0,
-            channels,
+            producers,
+            device,
             api,
-            direction: StreamDirection::Output,
-            channel_mask,
-            output_channels: 0,
-            output_channel_mask: 0,
-        };
-        let stream = match self.host.open_stream(&config, callbacks) {
-            Ok(stream) => stream,
-            Err(error) => return Err(error.to_string()),
-        };
-        let latency = match self.host.stream_latency(&stream) {
-            Ok(latency) => latency,
-            Err(error) => {
-                self.host.close_stream(stream);
-                return Err(error.to_string());
-            }
-        };
-        if latency.sample_rate == 0 {
-            self.host.close_stream(stream);
-            return Err("the monitor device reported no sample rate".to_string());
-        }
-        let rate = latency.sample_rate as f64;
-        let target = (latency.buffer as usize)
-            .saturating_mul(2)
-            .clamp(1024, (capacity / 2).max(1024));
-        let underruns = context.underruns.clone();
+        } = prepared;
         if self
             .monitor_tx
             .push(MonitorUpdate::Install {
@@ -985,29 +1102,24 @@ impl StreamBridge {
             .is_err()
         {
             self.host.close_stream(stream);
-            return Err("the monitor update queue is full".to_string());
+            return Err(MonitorError::new(
+                MH_ERR,
+                "the monitor update queue is full",
+            ));
         }
         if let Err(error) = self.host.start_stream(&stream) {
             let _ = self.monitor_tx.push(MonitorUpdate::SetEnabled(false));
             self.host.close_stream(stream);
-            return Err(error.to_string());
+            return Err(MonitorError::new(error.status, error.message));
         }
         self.monitor_stream = Some(stream);
         self.monitor_context = Some(context);
         self.monitor_underruns = Some(underruns);
+        self.monitor_device = Some((device, api));
         Ok(())
     }
 
-    pub fn start_monitor(
-        &mut self,
-        device: &str,
-        api: AudioApi,
-        channels: u32,
-        channel_mask: u64,
-    ) -> Result<(), String> {
-        if !self.duplex_monitor && self.monitor_stream.is_none() {
-            self.warm_monitor(device, api, channels, channel_mask)?;
-        }
+    fn enable_monitor(&mut self) -> Result<(), MonitorError> {
         if self.monitor_active {
             return Ok(());
         }
@@ -1016,10 +1128,55 @@ impl StreamBridge {
             .push(MonitorUpdate::SetEnabled(true))
             .is_err()
         {
-            return Err("the monitor update queue is full".to_string());
+            return Err(MonitorError::new(
+                MH_ERR,
+                "the monitor update queue is full",
+            ));
         }
         self.monitor_active = true;
         Ok(())
+    }
+
+    /// Installs and enables a monitor opened on a worker. Used by the app's
+    /// recovery path; `warm_monitor` covers the synchronous session-start path.
+    pub fn install_prepared_monitor_and_enable(
+        &mut self,
+        prepared: PreparedMonitor,
+    ) -> Result<(), MonitorError> {
+        self.install_prepared_monitor(prepared)?;
+        self.enable_monitor()
+    }
+
+    /// True when a non-duplex monitor stream is open for this exact device.
+    pub fn monitor_is_open_on(&self, device: &str, api: AudioApi) -> bool {
+        !self.duplex_monitor
+            && self.monitor_stream.is_some()
+            && self
+                .monitor_device
+                .as_ref()
+                .is_some_and(|(opened, opened_api)| opened == device && *opened_api == api)
+    }
+
+    pub fn start_monitor(
+        &mut self,
+        device: &str,
+        api: AudioApi,
+        channels: u32,
+        channel_mask: u64,
+    ) -> Result<(), MonitorError> {
+        if !self.duplex_monitor {
+            // A warmed stream is reused only for the device it was opened on;
+            // `warm_monitor` closes and reopens when the target changed.
+            let warmed_same = self.monitor_stream.is_some()
+                && self
+                    .monitor_device
+                    .as_ref()
+                    .is_some_and(|(opened, opened_api)| opened == device && *opened_api == api);
+            if !warmed_same {
+                self.warm_monitor(device, api, channels, channel_mask)?;
+            }
+        }
+        self.enable_monitor()
     }
 
     pub fn stop_monitor(&mut self) {
@@ -1035,6 +1192,7 @@ impl StreamBridge {
     /// instant re-enable on the same device.
     pub fn close_monitor(&mut self) {
         self.monitor_active = false;
+        self.monitor_device = None;
         if self.duplex_monitor {
             let _ = self.monitor_tx.push(MonitorUpdate::SetEnabled(false));
             return;
@@ -1046,6 +1204,19 @@ impl StreamBridge {
         }
         self.monitor_context = None;
         self.monitor_underruns = None;
+    }
+
+    pub fn monitor_is_active(&self) -> bool {
+        self.monitor_active
+    }
+
+    /// True when the monitor is running on exactly this device and API.
+    pub fn monitor_is_active_on(&self, device: &str, api: AudioApi) -> bool {
+        self.monitor_is_active()
+            && self
+                .monitor_device
+                .as_ref()
+                .is_some_and(|(opened, opened_api)| opened == device && *opened_api == api)
     }
 
     pub fn monitor_is_duplex(&self) -> bool {
@@ -1130,6 +1301,7 @@ impl StreamBridge {
 
     pub fn stop(&mut self) {
         self.monitor_active = false;
+        self.monitor_device = None;
         if let Some(stream) = self.monitor_stream.take() {
             let _ = self.monitor_tx.push(MonitorUpdate::SetEnabled(false));
             let _ = self.host.stop_stream(&stream);
