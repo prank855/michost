@@ -75,8 +75,8 @@ impl Fft {
     }
 
     fn run(&self, re: &mut [f32; FFT_SIZE], im: &mut [f32; FFT_SIZE], inverse: bool) {
-        for index in 0..FFT_SIZE {
-            let target = self.reverse[index] as usize;
+        for (index, &target) in self.reverse.iter().enumerate() {
+            let target = target as usize;
             if target > index {
                 re.swap(index, target);
                 im.swap(index, target);
@@ -547,8 +547,8 @@ impl Spectral {
             let high = (bin + radius).min(BINS - 1);
             let mut sum = 0.0;
             let mut count = 0.0;
-            for index in low..=high {
-                sum += self.log_spectrum[index];
+            for value in &self.log_spectrum[low..=high] {
+                sum += *value;
                 count += 1.0;
             }
             self.smoothed_log[bin] = sum / count;
